@@ -1,0 +1,24 @@
+# Dockerfile.dashboard
+# Lightweight Python 3.12 container for Tarantool 3.x VoIP Ecosystem Showcase Dashboard
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Copy application files
+COPY examples/billing_demo_server.py /app/billing_demo_server.py
+COPY benchmarks/matrix_benchmark_results.json /app/benchmarks/matrix_benchmark_results.json
+
+# Environment configuration
+ENV TNT_HOST=tnt_backend
+ENV TNT_PORT=3301
+ENV REDIS_HOST=redis_backend
+ENV REDIS_PORT=6379
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8089
+
+HEALTHCHECK --interval=5s --timeout=3s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/api/state', timeout=2)" || exit 1
+
+CMD ["python", "-u", "/app/billing_demo_server.py"]

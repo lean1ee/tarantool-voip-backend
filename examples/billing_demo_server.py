@@ -181,10 +181,15 @@ def auto_seed_if_empty():
 
 def load_benchmark_data():
     try:
-        path = os.path.join(os.path.dirname(__file__), "..", "benchmarks", "matrix_benchmark_results.json")
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+        paths = [
+            os.path.join(os.path.dirname(__file__), "..", "benchmarks", "matrix_benchmark_results.json"),
+            os.path.join(os.path.dirname(__file__), "benchmarks", "matrix_benchmark_results.json"),
+            "/app/benchmarks/matrix_benchmark_results.json"
+        ]
+        for path in paths:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
     except Exception:
         pass
     return None

@@ -144,6 +144,42 @@ services:
       voip_net:
         ipv4_address: 172.28.0.50
 
+  # 6. Interactive VoIP Billing & Cluster Showcase Dashboard
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: voip_dashboard
+    depends_on:
+      - tarantool
+      - redis
+    environment:
+      - TNT_HOST=172.28.0.10
+      - TNT_PORT=3301
+      - REDIS_HOST=172.28.0.15
+      - REDIS_PORT=6379
+    ports:
+      - "8089:8089"
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.89
+    restart: unless-stopped
+
+  # 7. Caddy Edge Reverse Proxy
+  caddy:
+    image: caddy:alpine
+    container_name: voip_caddy
+    depends_on:
+      - dashboard
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.90
+    restart: unless-stopped
+
 networks:
   voip_net:
     driver: bridge

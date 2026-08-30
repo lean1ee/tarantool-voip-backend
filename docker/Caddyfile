@@ -1,0 +1,20 @@
+# docker/Caddyfile
+# High-performance reverse proxy for Tarantool VoIP Ecosystem Dashboard
+
+:80 {
+    encode gzip zstd
+    
+    header {
+        X-Robots-Tag "noindex, nofollow"
+        X-Frame-Options "SAMEORIGIN"
+        X-Content-Type-Options "nosniff"
+        Server "Caddy-Tarantool-VoIP"
+    }
+
+    reverse_proxy 172.28.0.89:8089 {
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
