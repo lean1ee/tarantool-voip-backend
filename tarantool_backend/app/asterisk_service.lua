@@ -9,10 +9,10 @@ local log = require('log')
 local M = {}
 
 function M.init()
-    -- 1. Space: ps_endpoints (Space ID: 516)
+    -- 1. Space: ps_endpoints (Space ID: 520)
     if not box.space.ps_endpoints then
         local s = box.schema.space.create('ps_endpoints', {
-            id = 516,
+            id = 520,
             if_not_exists = true,
             engine = 'memtx',
             format = {
@@ -30,10 +30,10 @@ function M.init()
         s:create_index('primary', { parts = { 'id' }, if_not_exists = true })
     end
 
-    -- 2. Space: ps_auths (Space ID: 517)
+    -- 2. Space: ps_auths (Space ID: 521)
     if not box.space.ps_auths then
         local s = box.schema.space.create('ps_auths', {
-            id = 517,
+            id = 521,
             if_not_exists = true,
             engine = 'memtx',
             format = {
@@ -47,10 +47,10 @@ function M.init()
         s:create_index('primary', { parts = { 'id' }, if_not_exists = true })
     end
 
-    -- 3. Space: ps_aors (Space ID: 518)
+    -- 3. Space: ps_aors (Space ID: 522)
     if not box.space.ps_aors then
         local s = box.schema.space.create('ps_aors', {
-            id = 518,
+            id = 522,
             if_not_exists = true,
             engine = 'memtx',
             format = {
@@ -63,10 +63,10 @@ function M.init()
         s:create_index('primary', { parts = { 'id' }, if_not_exists = true })
     end
 
-    -- 4. Space: asterisk_cdrs (Space ID: 519)
+    -- 4. Space: asterisk_cdrs (Space ID: 523)
     if not box.space.asterisk_cdrs then
         local s = box.schema.space.create('asterisk_cdrs', {
-            id = 519,
+            id = 523,
             if_not_exists = true,
             engine = 'memtx',
             format = {
