@@ -14,53 +14,101 @@ In legacy VoIP deployments, state is fragmented across multiple independent data
 ### 1. Call Setup & Authorization Flow
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, sans-serif',
+    'fontSize': '13px',
+    'darkMode': true,
+    'actorBkg': '#1e293b',
+    'actorBorder': '#3b82f6',
+    'actorTextColor': '#f8fafc',
+    'actorLineColor': '#64748b',
+    'signalColor': '#60a5fa',
+    'signalTextColor': '#f8fafc',
+    'labelBoxBkgColor': '#0f172a',
+    'labelBoxBorderColor': '#334155',
+    'labelTextColor': '#f8fafc',
+    'loopTextColor': '#f8fafc',
+    'noteBorderColor': '#3b82f6',
+    'noteBkgColor': '#1e293b',
+    'noteTextColor': '#f8fafc',
+    'activationBorderColor': '#3b82f6',
+    'activationBkgColor': '#1d4ed833'
+  }
+}}%%
 sequenceDiagram
     autonumber
-    actor Caller as 📱 Caller
+    actor Caller as 📱 SIP Endpoint (Alice)
     participant Kam as ⚡ Kamailio / OpenSIPS
     participant TNT as 🔥 Tarantool 3.x (Memtx)
-    participant RTPE as 🎙️ RTPEngine
+    participant RTPE as 🎙️ RTPEngine Media Relay
 
-    Caller->>Kam: SIP INVITE (From: Alice, To: +1202...)
-    activate Kam
-    Kam->>TNT: IProto: billing_authorize_call(caller, callee, call_id)
-    activate TNT
-    Note over TNT: Atomic Lua TX (< 0.2 ms):<br/>1. Check balance & limits (subscribers)<br/>2. Match prefix rate (tariffs: $0.02/min)<br/>3. Compute max duration credit<br/>4. Store active dialog (kam_dialogs)
-    TNT-->>Kam: { allowed: true, max_duration: 75000s, rate: 0.02 }
-    deactivate TNT
-    Kam->>RTPE: NG offer (allocate RTP relay ports)
-    RTPE-->>Kam: 200 OK + SDP media ports
-    Kam-->>Caller: 180 Ringing / 200 OK (Call Established)
-    deactivate Kam
+    Caller->>+Kam: SIP INVITE (To: +12025550143)
+    
+    rect rgba(59, 130, 246, 0.08)
+        Kam->>+TNT: IProto: billing_authorize_call(caller, callee, call_id)
+        Note over TNT: ⚡ In-Memory Lua Transaction (&lt; 0.2 ms):<br/>1. Check Balance in space `subscribers`<br/>2. Anti-fraud channel limit check<br/>3. Match prefix `1` in `tariffs` ($0.02/min)<br/>4. Store active dialog in `kam_dialogs`
+        TNT-->>-Kam: { allowed: true, max_duration: 75000s, rate: 0.02 }
+    end
+
+    alt Balance & Concurrency Check Passed
+        Kam->>+RTPE: NG offer (allocate RTP relay ports)
+        RTPE-->>-Kam: 200 OK + SDP (Media Endpoints)
+        Kam-->>Caller: 180 Ringing
+        Kam-->>-Caller: 200 OK (Call Established)
+    else Insufficient Funds or Channel Limit Exceeded
+        Kam-->>Caller: 402 Payment Required / 486 Channel Limit
+    end
 ```
 
 ### 2. Call Teardown, Rating & Instant CDR Finalization
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, sans-serif',
+    'fontSize': '13px',
+    'darkMode': true,
+    'actorBkg': '#1e293b',
+    'actorBorder': '#10b981',
+    'actorTextColor': '#f8fafc',
+    'actorLineColor': '#64748b',
+    'signalColor': '#34d399',
+    'signalTextColor': '#f8fafc',
+    'labelBoxBkgColor': '#0f172a',
+    'labelBoxBorderColor': '#334155',
+    'labelTextColor': '#f8fafc',
+    'noteBorderColor': '#10b981',
+    'noteBkgColor': '#1e293b',
+    'noteTextColor': '#f8fafc'
+  }
+}}%%
 sequenceDiagram
     autonumber
-    actor Caller as 📱 Caller
+    actor Caller as 📱 SIP Endpoint (Alice)
     participant Kam as ⚡ Kamailio / OpenSIPS
-    participant RTPE as 🎙️ RTPEngine
+    participant RTPE as 🎙️ RTPEngine Media Relay
     participant TNT as 🔥 Tarantool 3.x (Memtx)
-    participant BI as 📊 Live Dashboard / Grafana
+    participant BI as 📊 Real-Time Grafana / BI
 
-    Caller->>Kam: SIP BYE (End Call)
-    activate Kam
-    Kam->>RTPE: NG delete (retrieve audio quality stats)
-    activate RTPE
-    RTPE-->>Kam: { duration: 185s, mos: 4.42, jitter: 1.15ms, loss: 0.02% }
-    deactivate RTPE
-    Kam->>TNT: IProto: billing_finalize_cdr(call_id, 185, stats)
-    activate TNT
-    Note over TNT: Atomic Lua Teardown TX:<br/>1. Calculate exact cost ($0.08)<br/>2. Debit balance: $25.00 -> $24.92<br/>3. Insert CDR enriched with MOS 4.42<br/>4. Evict active dialog
-    TNT-->>Kam: { status: "ok", billed: 0.08, remaining_balance: 24.92 }
-    deactivate TNT
-    Kam-->>Caller: 200 OK
-    deactivate Kam
-
-    BI->>TNT: billing_get_live_stats()
-    TNT-->>BI: Real-Time Fleet Revenue & Average MOS (Zero lock on SIP)
+    Caller->>+Kam: SIP BYE (Teardown Call)
+    
+    Kam->>+RTPE: NG delete (query audio quality counters)
+    RTPE-->>-Kam: { duration: 185s, mos: 4.42, jitter: 1.15ms, loss: 0.02% }
+    
+    rect rgba(16, 185, 129, 0.08)
+        Kam->>+TNT: IProto: billing_finalize_cdr(call_id, 185, stats)
+        Note over TNT: 💾 Instant Teardown Transaction (&lt; 0.2 ms):<br/>1. Calculate exact cost: 4 mins @ $0.02 = $0.08<br/>2. Atomically debit balance: $25.00 -> $24.92<br/>3. Insert CDR enriched with MOS 4.42 & Jitter<br/>4. Evict active dialog from `kam_dialogs`
+        TNT-->>-Kam: { status: "ok", billed: 0.08, remaining_balance: 24.92 }
+    end
+    
+    Kam-->>-Caller: 200 OK
+    
+    Note over BI,TNT: Continuous Non-Blocking Polling (0 lock on SIP signaling)
+    BI->>+TNT: IProto: billing_get_live_stats()
+    TNT-->>-BI: { active_calls: 0, revenue: $0.08, fleet_mos: 4.42 }
 ```
 
 ---

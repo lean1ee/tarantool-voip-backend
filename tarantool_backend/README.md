@@ -4,6 +4,70 @@ High-performance, transactional in-memory backend application for **RTPEngine**,
 
 ---
 
+## 🏗️ Backend Architecture
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, sans-serif',
+    'fontSize': '13px',
+    'darkMode': true,
+    'primaryColor': '#1e293b',
+    'primaryTextColor': '#f8fafc',
+    'primaryBorderColor': '#ef4444',
+    'lineColor': '#f87171',
+    'secondaryColor': '#0f172a',
+    'clusterBkg': '#0b0f19aa',
+    'clusterBorder': '#334155'
+  }
+}}%%
+flowchart TB
+    subgraph Network["🌐 Non-Blocking Network Layer (IProto Port 3301)"]
+        direction LR
+        IPROTO["<b>IProto Binary Listener</b><br/><code>box.cfg{ listen = '3301' }</code><br/><i>Fast MsgPack request dispatch</i>"]
+    end
+
+    subgraph MemtxEngine["💾 Memtx In-Memory Storage Engine"]
+        direction TB
+        subgraph Spaces["In-Memory Spaces &amp; Indexes"]
+            direction LR
+            S1[("<b>rtpe_calls</b><br/><code>512</code><br/>PK: call_id<br/>Sec: by_node, by_expire")]
+            S2[("<b>kam_dialogs</b><br/><code>514</code><br/>PK: call_id<br/>Sec: by_expire")]
+            S3[("<b>kam_usrloc</b><br/><code>515</code><br/>PK: contact_key<br/>Sec: by_user, by_expire")]
+            S4[("<b>subscribers</b><br/><code>516</code><br/>PK: subscriber_id<br/>Real-Time Balances")]
+            S5[("<b>tariffs</b><br/><code>517</code><br/>PK: prefix<br/>Rate Matrix")]
+            S6[("<b>cdrs</b><br/><code>518</code><br/>PK: cdr_id<br/>Rich MOS Records")]
+        end
+        subgraph Logic["Server-Side LuaJIT Services &amp; Background Fibers"]
+            direction LR
+            L1["<b>rtpe_service.lua</b><br/><i>select_node, failover</i>"]
+            L2["<b>billing_service.lua</b><br/><i>pre-call rating, anti-fraud, CDRs</i>"]
+            L3["<b>ttl_worker.lua</b><br/><i>Background cleanup fiber</i>"]
+        end
+    end
+
+    subgraph Persistence["🛡️ Zero-Jitter Streaming WAL Layer"]
+        WAL["<b>Write-Ahead Logging (WAL)</b><br/><code>wal_mode = 'write'</code><br/><i>Zero fork / COW audio jitter</i>"]
+    end
+
+    IPROTO ==> Spaces
+    Spaces <==> Logic
+    Spaces -.->|"Streaming WAL Append"| WAL
+
+    classDef net fill:#3b82f615,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
+    classDef tnt fill:#ef444415,stroke:#ef4444,stroke-width:2px,color:#f8fafc;
+    classDef space fill:#a855f720,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
+    classDef wal fill:#10b98115,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+
+    class IPROTO net;
+    class L1,L2,L3 tnt;
+    class S1,S2,S3,S4,S5,S6 space;
+    class WAL wal;
+```
+
+---
+
 ## 🚀 Quick Deployment & Installation Guide
 
 There are three ways to deploy and run the Tarantool VoIP Backend:

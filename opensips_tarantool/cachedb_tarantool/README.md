@@ -21,6 +21,65 @@ It acts as a high-performance in-memory state backend for dialog session synchro
 - **Memory Efficiency:** Compact binary MessagePack tuples reduce memory usage by 52% compared to plain string storage.
 - **Zero-Allocation Buffer Path:** Implements `tarantool_get_buf` (`CACHEDB_CAP_GET_BUF`) for direct single-pass decoding without intermediate heap allocations.
 
+---
+
+### Architecture
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, sans-serif',
+    'fontSize': '13px',
+    'darkMode': true,
+    'primaryColor': '#1e293b',
+    'primaryTextColor': '#f8fafc',
+    'primaryBorderColor': '#8b5cf6',
+    'lineColor': '#c084fc',
+    'secondaryColor': '#0f172a',
+    'clusterBkg': '#0b0f19aa',
+    'clusterBorder': '#334155'
+  }
+}}%%
+flowchart TB
+    subgraph OS["⚡ OpenSIPS 3.x SIP Engine"]
+        direction TB
+        CORE["<b>OpenSIPS Script Engine</b><br/><code>opensips.cfg / Routing Logic</code>"]
+        
+        subgraph Mod["📦 cachedb_tarantool Module"]
+            direction LR
+            INTF["<b>cachedb_funcs_t Driver</b><br/><i>get, set, remove</i>"]
+            POOL["<b>Connection Pool Engine</b><br/><i>Auto-reconnect &amp; TCP keepalive</i>"]
+            BUF["<b>Zero-Alloc get_buf</b><br/><i>CACHEDB_CAP_GET_BUF in-place msgpuck</i>"]
+        end
+    end
+
+    subgraph TNT["🔥 Tarantool 3.x In-Memory Cluster"]
+        direction LR
+        S1[("<b>kam_dialogs</b><br/><code>Space: 514</code>")]
+        S2[("<b>subscribers</b><br/><code>Space: 516</code>")]
+        S3[("<b>cdrs</b><br/><code>Space: 518</code>")]
+        PROC["<b>select_optimal_node()</b><br/><code>Relay Load-Balancing (70 µs)</code>"]
+    end
+
+    CORE --> INTF
+    INTF --> POOL
+    POOL --> BUF
+    BUF ===>|"<b>Binary IProto (TCP: 3301)</b><br/><code>Single-Pass Stream</code>"| TNT
+
+    classDef sip fill:#8b5cf615,stroke:#8b5cf6,stroke-width:2px,color:#f8fafc;
+    classDef mod fill:#3b82f615,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
+    classDef tnt fill:#ef444415,stroke:#ef4444,stroke-width:2px,color:#f8fafc;
+    classDef space fill:#a855f720,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
+
+    class CORE sip;
+    class INTF,POOL,BUF mod;
+    class PROC tnt;
+    class S1,S2,S3 space;
+```
+
+---
+
 ### Dependencies
 
 #### OpenSIPS Modules

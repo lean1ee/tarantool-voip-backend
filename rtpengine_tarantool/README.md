@@ -26,30 +26,56 @@ Native C-driver for **Sipwise RTPEngine** (`daemon/tarantool.c`) enabling carrie
 
 ## 🏗️ C Driver Architecture
 
-```text
-┌────────────────────────────────────────────────────────────┐
-│                    RTPEngine Media Relay                   │
-│                                                            │
-│  Control: NG Protocol (UDP:22222)                          │
-│  Media:   RTP/SRTP Streams (UDP:30000-40000)               │
-│                                                            │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │             tarantool.c (IProto C Driver)            │  │
-│  │                                                      │  │
-│  │  - Non-blocking libevent integration                 │  │
-│  │  - Automatic reconnection & greeting handshake       │  │
-│  │  - Zero-alloc MessagePack serialization (msgpuck.h)  │  │
-│  └──────────────────────────┬───────────────────────────┘  │
-└─────────────────────────────┼──────────────────────────────┘
-                              │
-               Binary IProto  │ (TCP:3301, TCP_NODELAY)
-                              ▼
-┌────────────────────────────────────────────────────────────┐
-│                   Tarantool 3.x In-Memory                  │
-│                                                            │
-│  Space: rtpe_calls (call_id, node_id, state, timestamps)   │
-│  TTL Fiber: Automatic background expiration (ttl_worker)   │
-└────────────────────────────────────────────────────────────┘
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, sans-serif',
+    'fontSize': '13px',
+    'darkMode': true,
+    'primaryColor': '#1e293b',
+    'primaryTextColor': '#f8fafc',
+    'primaryBorderColor': '#f59e0b',
+    'lineColor': '#fbbf24',
+    'secondaryColor': '#0f172a',
+    'clusterBkg': '#0b0f19aa',
+    'clusterBorder': '#334155'
+  }
+}}%%
+flowchart TB
+    subgraph RTPE["🎙️ Sipwise RTPEngine Media Relay"]
+        direction TB
+        NG["<b>NG Control Protocol</b><br/><code>UDP: 22222</code><br/><i>Offers, Answers, Deletes</i>"]
+        MEDIA["<b>RTP / SRTP Media Streams</b><br/><code>UDP: 30000–40000</code><br/><i>G.711, Opus, VP8, H.264</i>"]
+        
+        subgraph Driver["⚡ Native IProto Driver (daemon/tarantool.c)"]
+            direction LR
+            EV["<b>libevent Async Loop</b><br/><i>Non-blocking I/O</i>"]
+            MP["<b>msgpuck.h Serialization</b><br/><i>Zero-Alloc Scatter-Gather</i>"]
+            RECON["<b>Auto-Reconnection</b><br/><i>Greeting handshake &amp; auth</i>"]
+        end
+    end
+
+    subgraph TNT["🔥 Tarantool 3.x In-Memory Cluster"]
+        direction TB
+        SP1[("<b>rtpe_calls</b> (Space 512)<br/><code>call_id, node_id, state, timestamps</code>")]
+        SP2[("<b>cdrs</b> (Space 518)<br/><code>duration, billed, MOS score, jitter</code>")]
+        FIBER["<b>ttl_worker Fiber</b><br/><i>Continuous Non-Blocking Sweep</i>"]
+    end
+
+    NG --> EV
+    MEDIA -.->|"Real-Time MOS / Jitter Counters"| MP
+    EV ===>|"<b>Binary IProto (TCP: 3301)</b><br/><code>TCP_NODELAY, Zero-Copy writev</code>"| TNT
+
+    classDef rtpe fill:#f59e0b15,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+    classDef driver fill:#3b82f615,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
+    classDef tnt fill:#ef444415,stroke:#ef4444,stroke-width:2px,color:#f8fafc;
+    classDef space fill:#a855f720,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
+
+    class NG,MEDIA rtpe;
+    class EV,MP,RECON driver;
+    class FIBER tnt;
+    class SP1,SP2 space;
 ```
 
 ---

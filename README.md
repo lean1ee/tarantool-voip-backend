@@ -10,67 +10,87 @@ A carrier-grade, transactional in-memory clustering and media session synchroniz
 
 ---
 
-## 🔗 Repository Links & Feature Branches
+## 🔗 Repository Links, Feature Branches & Upstream PRs
 
-| Component | Upstream Project | Feature Branch & Fork | Module / Driver Path |
-|:---|:---|:---|:---|
-| **RTPEngine** | `sipwise/rtpengine` | [lean1ee/rtpengine (`feature/tarantool`)](https://github.com/lean1ee/rtpengine/tree/feature/tarantool) | `daemon/tarantool.c` |
-| **Kamailio** | `kamailio/kamailio` | [lean1ee/kamailio (`feature/ndb_tarantool`)](https://github.com/lean1ee/kamailio/tree/feature/ndb_tarantool) | `src/modules/ndb_tarantool/` |
-| **OpenSIPS** | `OpenSIPS/opensips` | [lean1ee/opensips (`feature/cachedb_tarantool`)](https://github.com/lean1ee/opensips/tree/feature/cachedb_tarantool) | `modules/cachedb_tarantool/` |
-| **Backend App** | `tarantool/tarantool` | [lean1ee/tarantool-voip-backend](https://github.com/lean1ee/tarantool-voip-backend) | `tarantool_backend/` |
+| Component | Upstream Project | Official Upstream PR | Feature Branch & Fork | Module / Driver Path |
+|:---|:---|:---|:---|:---|
+| **Kamailio** | `kamailio/kamailio` | [**PR #4898**](https://github.com/kamailio/kamailio/pull/4898) | [lean1ee/kamailio (`feature/ndb_tarantool`)](https://github.com/lean1ee/kamailio/tree/feature/ndb_tarantool) | `src/modules/ndb_tarantool/` |
+| **OpenSIPS** | `OpenSIPS/opensips` | [**PR #4231**](https://github.com/OpenSIPS/opensips/pull/4231) | [lean1ee/opensips (`feature/cachedb_tarantool`)](https://github.com/lean1ee/opensips/tree/feature/cachedb_tarantool) | `modules/cachedb_tarantool/` |
+| **RTPEngine** | `sipwise/rtpengine` | [**PR #2163**](https://github.com/sipwise/rtpengine/pull/2163) | [lean1ee/rtpengine (`feature/tarantool`)](https://github.com/lean1ee/rtpengine/tree/feature/tarantool) | `daemon/tarantool.c` |
+| **Backend App** | `tarantool/tarantool` | *Standalone Hub* | [lean1ee/tarantool-voip-backend](https://github.com/lean1ee/tarantool-voip-backend) | `tarantool_backend/` |
 
 ---
 
 ## 🏗️ Architecture Overview
 
 ```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, -apple-system, sans-serif',
+    'fontSize': '13px',
+    'darkMode': true,
+    'primaryColor': '#1e293b',
+    'primaryTextColor': '#f8fafc',
+    'primaryBorderColor': '#3b82f6',
+    'lineColor': '#60a5fa',
+    'secondaryColor': '#0f172a',
+    'tertiaryColor': '#111827',
+    'clusterBkg': '#0b0f19aa',
+    'clusterBorder': '#334155',
+    'edgeLabelBackground': '#0f172a'
+  }
+}}%%
 flowchart TB
     subgraph Clients["📱 SIP Clients & Endpoints"]
-        UAC["SIP User Agents (UAC / UAS)<br/><code>Audio / Video RTP Streams</code>"]
-    end
-
-    subgraph Signaling["⚡ SIP Signaling Layer (Kamailio & OpenSIPS)"]
         direction LR
-        KAM["<b>Kamailio 6.x</b><br/><code>mod ndb_tarantool</code><br/><i>Async IProto Pool</i>"]
-        OS["<b>OpenSIPS 3.x</b><br/><code>cachedb_tarantool</code><br/><i>Zero-Alloc get_buf</i>"]
+        UAC["<b>SIP User Agents (UAC / UAS)</b><br/><code>G.711 / Opus RTP Audio Streams</code><br/><i>SIPp Benchmarking Arm</i>"]
     end
 
-    subgraph Media["🎙️ Media Relay Layer (RTPEngine)"]
-        RTPE["<b>RTPEngine Daemon</b><br/><code>tarantool.c driver</code><br/><i>libevent Non-blocking Client</i>"]
+    subgraph Signaling["⚡ High-Throughput SIP Signaling Plane"]
+        direction LR
+        KAM["<b>Kamailio 6.x SIP Server</b><br/><code>mod ndb_tarantool</code><br/><i>• Async IProto Connection Pool<br/>• Native KEMI Lua / Python API</i>"]
+        OS["<b>OpenSIPS 3.x SIP Server</b><br/><code>cachedb_tarantool</code><br/><i>• Official cachedb_funcs_t Driver<br/>• Zero-Alloc CACHEDB_CAP_GET_BUF</i>"]
+    end
+
+    subgraph Media["🎙️ Media Relay Layer"]
+        RTPE["<b>Sipwise RTPEngine Media Relay</b><br/><code>daemon/tarantool.c driver</code><br/><i>• libevent Non-Blocking IProto Client<br/>• Zero-Copy Scatter-Gather MsgPack<br/>• Real-Time MOS &amp; Jitter Export</i>"]
     end
 
     subgraph Backend["🔥 Tarantool 3.x In-Memory Unified Engine"]
         direction TB
-        subgraph Memtx["Memtx In-Memory Spaces (512 MB Arena)"]
-            S1[("<code>rtpe_calls</code><br/><b>512</b><br/>Active Media Sessions")]
-            S2[("<code>kam_dialogs</code><br/><b>514</b><br/>Active SIP Dialogs")]
-            S3[("<code>subscribers</code><br/><b>516</b><br/>Real-Time Balances")]
-            S4[("<code>tariffs</code><br/><b>517</b><br/>Prefix Rate Matrix")]
-            S5[("<code>cdrs</code><br/><b>518</b><br/>Rich CDRs + MOS Quality")]
+        subgraph Memtx["💾 In-Memory Spaces (512 MB Slab Arena)"]
+            direction LR
+            S1[("<b>rtpe_calls</b><br/><code>ID: 512</code><br/><i>Media Sessions</i>")]
+            S2[("<b>kam_dialogs</b><br/><code>ID: 514</code><br/><i>Active Dialogs</i>")]
+            S3[("<b>subscribers</b><br/><code>ID: 516</code><br/><i>Balances &amp; Limits</i>")]
+            S4[("<b>tariffs</b><br/><code>ID: 517</code><br/><i>Prefix Rates</i>")]
+            S5[("<b>cdrs</b><br/><code>ID: 518</code><br/><i>Rich CDRs + MOS</i>")]
         end
-        subgraph Engine["Server-Side LuaJIT & Background Fibers"]
-            LUA1["<code>billing_authorize_call</code><br/><i>Rating & Anti-Fraud (&lt; 0.2 ms)</i>"]
-            LUA2["<code>select_optimal_node</code><br/><i>Least-Loaded Relay (70 µs)</i>"]
-            LUA3["<code>ttl_worker fiber</code><br/><i>Continuous Non-blocking Sweep</i>"]
+        subgraph Engine["⚡ Server-Side LuaJIT Logic &amp; Fibers"]
+            direction LR
+            LUA1["<b>billing_authorize_call()</b><br/><code>Pre-Call Rating (&lt; 0.2 ms)</code><br/><i>Balance check &amp; anti-fraud</i>"]
+            LUA2["<b>select_optimal_node()</b><br/><code>Relay Load-Balancing (70 µs)</code><br/><i>Least-loaded media node</i>"]
+            LUA3["<b>ttl_worker fiber</b><br/><code>Continuous TTL Sweep</code><br/><i>Non-blocking secondary index</i>"]
         end
     end
 
-    UAC -->|"SIP INVITE / BYE (UDP:5060/5070)"| KAM
-    UAC -->|"SIP INVITE / BYE (UDP:5060/5070)"| OS
-    UAC <===>|"RTP/SRTP Media (UDP:30000-40000)"| RTPE
+    UAC ==>|"<b>SIP Signalling</b><br/><code>UDP: 5060 / 5070</code>"| KAM
+    UAC ==>|"<b>SIP Signalling</b><br/><code>UDP: 5060 / 5070</code>"| OS
+    UAC <=====>|"<b>RTP/SRTP Media Streams</b><br/><code>UDP: 30000–40000</code>"| RTPE
 
-    KAM -->|"NG Protocol (UDP:22222)"| RTPE
-    OS -->|"NG Protocol (UDP:22222)"| RTPE
+    KAM -.->|"<b>NG Protocol</b> (offers/answers)<br/><code>UDP: 22222</code>"| RTPE
+    OS -.->|"<b>NG Protocol</b> (offers/answers)<br/><code>UDP: 22222</code>"| RTPE
 
-    KAM ==>|"Binary IProto (TCP:3301)<br/>Pre-Call Auth &amp; Dialogs"| Backend
-    OS ==>|"Binary IProto (TCP:3301)<br/>CacheDB Key-Value &amp; RPC"| Backend
-    RTPE ==>|"Binary IProto (TCP:3301)<br/>Save Call &amp; Finalize CDR with MOS"| Backend
+    KAM ===>|"<b>Binary IProto (TCP: 3301)</b><br/><i>Pre-Call Auth &amp; Dialogs</i>"| Backend
+    OS ===>|"<b>Binary IProto (TCP: 3301)</b><br/><i>CacheDB Key-Value &amp; RPC</i>"| Backend
+    RTPE ===>|"<b>Binary IProto (TCP: 3301)</b><br/><i>Active Calls &amp; CDR Finalize</i>"| Backend
 
-    classDef tnt fill:#ff453a22,stroke:#ff453a,stroke-width:2px,color:#fff;
-    classDef sip fill:#3b82f622,stroke:#3b82f6,stroke-width:2px,color:#fff;
-    classDef media fill:#f59e0b22,stroke:#f59e0b,stroke-width:2px,color:#fff;
-    classDef client fill:#10b98122,stroke:#10b981,stroke-width:2px,color:#fff;
-    classDef space fill:#8b5cf622,stroke:#8b5cf6,stroke-width:1.5px,color:#fff;
+    classDef tnt fill:#ef444415,stroke:#ef4444,stroke-width:2px,color:#f8fafc;
+    classDef sip fill:#3b82f615,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
+    classDef media fill:#f59e0b15,stroke:#f59e0b,stroke-width:2px,color:#f8fafc;
+    classDef client fill:#10b98115,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+    classDef space fill:#a855f720,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
 
     class KAM,OS sip;
     class RTPE media;

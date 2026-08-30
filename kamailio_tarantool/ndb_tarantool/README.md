@@ -25,6 +25,63 @@ While Redis is commonly used via `ndb_redis`, telecom and VoIP signaling workloa
 
 ---
 
+## 🏗️ Module Architecture
+
+```mermaid
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'fontFamily': 'Inter, system-ui, sans-serif',
+    'fontSize': '13px',
+    'darkMode': true,
+    'primaryColor': '#1e293b',
+    'primaryTextColor': '#f8fafc',
+    'primaryBorderColor': '#3b82f6',
+    'lineColor': '#60a5fa',
+    'secondaryColor': '#0f172a',
+    'clusterBkg': '#0b0f19aa',
+    'clusterBorder': '#334155'
+  }
+}}%%
+flowchart TB
+    subgraph Kam["⚡ Kamailio 6.x Core &amp; SIP Worker Processes"]
+        direction TB
+        SIP["<b>SIP Signaling Dispatcher</b><br/><code>kamailio.cfg / KEMI Router</code>"]
+        
+        subgraph Mod["📦 ndb_tarantool Module"]
+            direction LR
+            KEMI["<b>KSR.tarantool API</b><br/><i>call, eval, select</i>"]
+            POOL["<b>Worker Connection Pool</b><br/><i>Async non-blocking sockets</i>"]
+            SG["<b>Zero-Alloc Engine</b><br/><i>writev scatter-gather msgpuck</i>"]
+        end
+    end
+
+    subgraph TNT["🔥 Tarantool 3.x Cluster"]
+        direction LR
+        S1[("<b>kam_dialogs</b><br/><code>Space: 514</code>")]
+        S2[("<b>kam_usrloc</b><br/><code>Space: 515</code>")]
+        S3[("<b>subscribers</b><br/><code>Space: 516</code>")]
+        PROC["<b>billing_authorize_call()</b><br/><code>Rating &amp; Anti-Fraud (&lt; 0.2 ms)</code>"]
+    end
+
+    SIP --> KEMI
+    KEMI --> POOL
+    POOL --> SG
+    SG ===>|"<b>Binary IProto (TCP: 3301)</b><br/><code>Zero-Copy Stream</code>"| TNT
+
+    classDef sip fill:#3b82f615,stroke:#3b82f6,stroke-width:2px,color:#f8fafc;
+    classDef mod fill:#10b98115,stroke:#10b981,stroke-width:2px,color:#f8fafc;
+    classDef tnt fill:#ef444415,stroke:#ef4444,stroke-width:2px,color:#f8fafc;
+    classDef space fill:#a855f720,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
+
+    class SIP sip;
+    class KEMI,POOL,SG mod;
+    class PROC tnt;
+    class S1,S2,S3 space;
+```
+
+---
+
 ## ⚙️ Module Parameters (`kamailio.cfg`)
 
 | Parameter | Type | Default | Description |
