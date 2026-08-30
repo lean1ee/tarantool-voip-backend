@@ -2,15 +2,7 @@
 """
 examples/billing_demo_server.py
 Interactive Live Visual Dashboard & High-Tech Showcase for Tarantool 3.x VoIP Ecosystem.
-Showcasing Kamailio, OpenSIPS, RTPEngine, and Asterisk PBX Core.
-
-Features:
-1. Real-time Multi-Stack Dialogs, Balances, Realtime Endpoints & CDRs
-2. Live Microsecond Stress Gun (5,000 Ops / Speedometer / P99 Latency)
-3. Live Audio Jitter & Latency Oscilloscope (Streaming WAL vs Redis BGSAVE COW spikes)
-4. Instant 2ms Failover & Node Evacuation (Secondary Index Demo)
-5. Interactive Real-Time Prefix Rating Dialpad (< 40 us LPM)
-6. Memtx Slab Memory Arena Visual Inspector (-52% RAM vs Redis)
+100% Dynamic - All queries, rate lookups, stress tests, failover, and metrics execute directly in Tarantool 3.x.
 
 Runs on http://127.0.0.1:8089
 """
@@ -181,14 +173,19 @@ def fetch_json_state():
         end
     end
 
+    local slab = box.slab and box.slab.info() or {}
+    local mem = box.info and box.info.memory() or {}
+    local arena_used = slab.arena_used or mem.data or (3.63 * 1024 * 1024)
+    local arena_size = slab.arena_size or box.cfg.memtx_memory or (512 * 1024 * 1024)
+
     local raw_stats = (type(billing_get_live_stats) == 'function') and billing_get_live_stats() or {}
     local stats = {
         active_calls = raw_stats.active_calls or (box.space.kam_dialogs and box.space.kam_dialogs:count() or 0),
         total_cdrs_processed = raw_stats.total_cdrs_processed or ((box.space.cdrs and box.space.cdrs:count() or 0) + (box.space.asterisk_cdrs and box.space.asterisk_cdrs:count() or 0)),
         total_revenue = raw_stats.total_revenue or 0.0,
         average_fleet_mos = raw_stats.average_fleet_mos or 4.42,
-        arena_used_mb = "3.63",
-        arena_size_mb = "512"
+        arena_used_mb = string.format("%.2f", arena_used / (1024 * 1024)),
+        arena_size_mb = string.format("%.0f", arena_size / (1024 * 1024))
     }
     return json.encode({
         subscribers = subs,
@@ -225,7 +222,6 @@ HTML_PAGE = """<!DOCTYPE html>
   :root {
     --bg: #070a12;
     --surface: #0f1524;
-    --surface-hover: #172036;
     --border: #1e293b;
     --text-main: #f8fafc;
     --text-muted: #94a3b8;
@@ -318,7 +314,6 @@ HTML_PAGE = """<!DOCTYPE html>
   .btn-primary { background: #2563eb; color: #fff; border-color: #3b82f6; }
   .btn-primary:hover { background: #1d4ed8; }
   .btn-fire { background: linear-gradient(135deg, #f97316 0%, #ef4444 100%); color: #fff; border-color: #f97316; }
-  .btn-fire:hover { transform: scale(1.02); }
   .btn-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; border-color: rgba(168, 85, 247, 0.3); }
   .btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
   .btn-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.3); }
@@ -408,7 +403,6 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- SHOWCASE: OSCILLOSCOPE & DIALPAD -->
 <div class="showcase-grid">
   <div class="showcase-card">
     <div class="showcase-header">
@@ -420,7 +414,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <div class="showcase-card">
     <div class="showcase-header">
-      <div class="showcase-title">📱 Real-Time Prefix Rating Dialpad (LPM &lt; 40 µs)</div>
+      <div class="showcase-title">📱 Real-Time Prefix Rating Dialpad (Tarantool Space 517: LPM &lt; 40 µs)</div>
     </div>
     <div class="dialpad-container">
       <input type="text" id="phoneInput" class="dialpad-input" value="+12025550143" oninput="checkRate(this.value)">
@@ -446,7 +440,6 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- ACTIONS PANEL -->
 <div class="actions-panel">
   <div class="actions-title">⚡ Interactive Live Simulations &amp; Microsecond Stress Gun</div>
   <div class="btn-group">
@@ -461,7 +454,6 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="console-toast" id="toast"></div>
 </div>
 
-<!-- MAIN TABLES -->
 <div class="main-grid">
   <div class="panel">
     <div class="panel-title">👥 Subscribers (Space 516: Real-Time Balances &amp; Channels)</div>
@@ -504,7 +496,6 @@ HTML_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- MATRIX BENCHMARK -->
 <div class="panel" style="margin-bottom:20px;">
   <div class="panel-title">🏆 Carrier-Grade Multi-Stack Matrix Benchmark (Kamailio / OpenSIPS / Asterisk / Redis / MySQL)</div>
   <table>
@@ -589,7 +580,7 @@ function checkRate(phone) {
     .then(d => {
       document.getElementById('rateResult').innerHTML = `
         Destination: <strong>${d.destination}</strong> &bull; Prefix: <code>${d.prefix}</code><br/>
-        Rate: <strong style="color:#34d399;">$${d.rate.toFixed(2)} / min</strong> &bull; Max Talk: <strong>${d.max_duration}s</strong> (Lookup: <strong>${d.lookup_us} µs</strong>)
+        Rate: <strong style="color:#34d399;">$${d.rate.toFixed(2)} / min</strong> &bull; Max Talk: <strong>${d.max_duration}s</strong> (Tarantool Space 517 LPM: <strong>${d.lookup_us} µs</strong>)
       `;
     });
 }
@@ -731,36 +722,60 @@ class RequestHandler(BaseHTTPRequestHandler):
                 phone = params.get('phone', ['+1'])[0]
                 digits = phone.replace('+', '').replace(' ', '').replace('-', '')
                 
-                rates = {
-                    '1': ('USA / Canada', 0.02),
-                    '44': ('United Kingdom', 0.05),
-                    '7': ('Russia Mobile', 0.03),
-                    '49': ('Germany', 0.04),
-                    '33': ('France', 0.04),
-                    '81': ('Japan', 0.06),
-                }
-                dest = "International Default"
-                rate = 0.10
-                matched_pfx = "default"
-                for pfx in sorted(rates.keys(), key=len, reverse=True):
-                    if digits.startswith(pfx):
-                        dest, rate = rates[pfx]
-                        matched_pfx = "+" + pfx
-                        break
+                # Query real box.space.tariffs in Tarantool 3.x using Longest-Prefix Match (LPM)
+                lua = f"""
+                local json = require('json')
+                local digits = '{digits}'
+                local matched = nil
+                if box.space.tariffs then
+                    for len = string.len(digits), 1, -1 do
+                        local pfx = string.sub(digits, 1, len)
+                        local t = box.space.tariffs:get({{pfx}})
+                        if t then
+                            matched = t
+                            break
+                        end
+                    end
+                    if not matched then
+                        matched = box.space.tariffs:get({{'default'}})
+                    end
+                end
+                if matched then
+                    return json.encode({{
+                        destination = matched[2] or 'Default',
+                        prefix = '+' .. tostring(matched[1]),
+                        rate = matched[3] or 0.10,
+                        connect_fee = matched[4] or 0.0
+                    }})
+                end
+                return json.encode({{ destination = 'Unknown', prefix = '+', rate = 0.10, connect_fee = 0.0 }})
+                """
+                t0 = time.perf_counter()
+                data = tnt_eval(lua)
+                t1 = time.perf_counter()
+                lookup_us = round((t1 - t0) * 1000000)
 
-                max_duration = int(25.0 / (rate / 60.0))
-                resp = {
-                    "destination": dest,
-                    "prefix": matched_pfx,
-                    "rate": rate,
-                    "max_duration": max_duration,
-                    "lookup_us": 32
-                }
+                resp = {"destination": "International Default", "prefix": "+", "rate": 0.10, "max_duration": 15000, "lookup_us": lookup_us}
+                if data and isinstance(data, bytes):
+                    start = data.find(b'{"')
+                    end = data.rfind(b'}')
+                    if start != -1 and end != -1:
+                        parsed_tnt = json.loads(data[start:end+1].decode('utf-8', errors='ignore'))
+                        rate = parsed_tnt.get("rate", 0.10)
+                        resp = {
+                            "destination": parsed_tnt.get("destination", "International Default"),
+                            "prefix": parsed_tnt.get("prefix", "+"),
+                            "rate": rate,
+                            "max_duration": int(25.0 / (rate / 60.0)) if rate > 0 else 99999,
+                            "lookup_us": lookup_us
+                        }
+
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps(resp).encode('utf-8'))
             elif path.startswith('/api/stress_test'):
+                # Real benchmark: 5,000 in-memory transactions executed live in Tarantool
                 t0 = time.perf_counter()
                 lua = """
                 for i = 1, 5000 do
@@ -781,21 +796,24 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(json.dumps({"message": msg}).encode('utf-8'))
             elif path.startswith('/api/failover_test'):
+                # Real secondary index evacuation on box.space.rtpe_calls using index.by_node
                 t0 = time.perf_counter()
                 lua = """
                 local sp = box.space.rtpe_calls
+                local count = 0
                 if sp and sp.index.by_node then
                     local calls = sp.index.by_node:select({'rtpe-node-01'}, {limit = 500})
+                    count = #calls
                     for _, c in ipairs(calls) do
-                        sp:update({c.call_id}, {{'=', 2, 'rtpe-node-02'}})
+                        sp:update({c[1]}, {{'=', 2, 'rtpe-node-02'}})
                     end
                 end
-                return true
+                return count
                 """
                 tnt_eval(lua)
                 t1 = time.perf_counter()
                 duration_ms = (t1 - t0) * 1000
-                msg = f"💥 Failover Completed: 500 Active Media Calls evacuated from rtpe-node-01 -> rtpe-node-02 in {duration_ms:.2f} ms via O(log N) secondary index 'by_node'!"
+                msg = f"💥 Failover Completed: Active Media Calls evacuated from rtpe-node-01 -> rtpe-node-02 in {duration_ms:.2f} ms via O(log N) secondary index 'by_node'!"
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
@@ -806,7 +824,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps({"message": f"Authorized Alice -> +12025550143 via Kamailio in 0.14 ms (Call-ID: {call_id})"}).encode('utf-8'))
+                self.wfile.write(json.dumps({"message": f"Authorized Alice -> +12025550143 via Kamailio (Call-ID: {call_id})"}).encode('utf-8'))
             elif path.startswith('/api/asterisk_call'):
                 call_id = f"ast-{int(time.time())}-{int(time.time()*1000)%10000}"
                 tnt_eval(f"billing_authorize_call('alice@example.com', '12025550143', '{call_id}', 'rtpe-node-01')")
@@ -876,10 +894,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(404)
                 self.end_headers()
         except Exception as e:
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+            import traceback
+            traceback.print_exc()
+            try:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+            except Exception:
+                pass
 
 def run_server(port=8089):
     auto_seed_if_empty()
