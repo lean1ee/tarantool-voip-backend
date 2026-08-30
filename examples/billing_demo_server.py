@@ -259,6 +259,16 @@ def fetch_json_state():
     local arena_used = slab.arena_used or mem.data or (3.63 * 1024 * 1024)
     local arena_size = slab.arena_size or box.cfg.memtx_memory or (512 * 1024 * 1024)
 
+    local space_breakdown = {
+        rtpe_calls = box.space.rtpe_calls and box.space.rtpe_calls:count() or 0,
+        kam_dialogs = box.space.kam_dialogs and box.space.kam_dialogs:count() or 0,
+        ps_endpoints = box.space.ps_endpoints and box.space.ps_endpoints:count() or 0,
+        asterisk_cdrs = box.space.asterisk_cdrs and box.space.asterisk_cdrs:count() or 0,
+        cdrs = box.space.cdrs and box.space.cdrs:count() or 0,
+        subscribers = box.space.subscribers and box.space.subscribers:count() or 0,
+        tariffs = box.space.tariffs and box.space.tariffs:count() or 0
+    }
+
     local raw_stats = (type(billing_get_live_stats) == 'function') and billing_get_live_stats() or {}
     local stats = {
         active_calls = raw_stats.active_calls or (box.space.kam_dialogs and box.space.kam_dialogs:count() or 0),
@@ -266,7 +276,8 @@ def fetch_json_state():
         total_revenue = raw_stats.total_revenue or 0.0,
         average_fleet_mos = raw_stats.average_fleet_mos or 4.42,
         arena_used_mb = string.format("%.2f", arena_used / (1024 * 1024)),
-        arena_size_mb = string.format("%.0f", arena_size / (1024 * 1024))
+        arena_size_mb = string.format("%.0f", arena_size / (1024 * 1024)),
+        space_breakdown = space_breakdown
     }
     return json.encode({
         subscribers = subs,
@@ -515,14 +526,14 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div style="margin-top:14px;">
       <div class="showcase-title" style="font-size:12px;">🔬 Memtx Slab Arena Breakdown (Zero Fragmentation)</div>
-      <div class="slab-bar-wrap">
-        <div class="slab-segment" style="width:25%;background:#3b82f6;" title="rtpe_calls"></div>
-        <div class="slab-segment" style="width:15%;background:#06b6d4;" title="kam_dialogs"></div>
-        <div class="slab-segment" style="width:20%;background:#a855f7;" title="ps_endpoints"></div>
-        <div class="slab-segment" style="width:30%;background:#10b981;" title="asterisk_cdrs"></div>
-        <div class="slab-segment" style="width:10%;background:#f59e0b;" title="subscribers"></div>
+      <div class="slab-bar-wrap" id="slab-bar">
+        <div class="slab-segment" style="width:25%;background:#3b82f6;" title="RTPEngine Calls (Space 512)"></div>
+        <div class="slab-segment" style="width:15%;background:#06b6d4;" title="Kamailio Dialogs (Space 514)"></div>
+        <div class="slab-segment" style="width:20%;background:#a855f7;" title="PJSIP Endpoints (Space 520)"></div>
+        <div class="slab-segment" style="width:25%;background:#10b981;" title="Asterisk CDRs (Space 523)"></div>
+        <div class="slab-segment" style="width:15%;background:#f59e0b;" title="Subscribers (Space 516)"></div>
       </div>
-      <div style="font-size:11px;color:#94a3b8;display:flex;justify-content:space-between;">
+      <div style="font-size:11px;color:#94a3b8;display:flex;justify-content:space-between;" id="slab-footer-info">
         <span>Spaces: 9 (Memtx Slab)</span>
         <span>Alloc Arena: 512 MB &bull; Used: 3.63 MB</span>
       </div>
@@ -717,6 +728,28 @@ function refreshState() {
       document.getElementById('stat-cdrs').innerText = (d.cdrs.length + (d.ast_cdrs ? d.ast_cdrs.length : 0));
       document.getElementById('stat-rev').innerText = '$' + (d.stats.total_revenue || 0).toFixed(2);
       document.getElementById('stat-ram').innerText = (d.stats.arena_used_mb || "3.63") + " MB";
+
+      if (d.stats && d.stats.space_breakdown) {
+        const sb = d.stats.space_breakdown;
+        const total = Math.max(1, (sb.rtpe_calls || 0) + (sb.kam_dialogs || 0) + (sb.ps_endpoints || 0) + (sb.asterisk_cdrs || 0) + (sb.cdrs || 0) + (sb.subscribers || 0) + (sb.tariffs || 0));
+        const rtpeW = Math.max(8, ((sb.rtpe_calls || 0) / total) * 100);
+        const kamW = Math.max(8, ((sb.kam_dialogs || 0) / total) * 100);
+        const epW = Math.max(12, ((sb.ps_endpoints || 0) / total) * 100);
+        const astW = Math.max(15, ((sb.asterisk_cdrs || 0) / total) * 100);
+        const subW = Math.max(15, ((sb.subscribers || 0) / total) * 100);
+
+        document.getElementById('slab-bar').innerHTML = `
+          <div class="slab-segment" style="width:${rtpeW}%;background:#3b82f6;" title="RTPEngine Calls (Space 512): ${sb.rtpe_calls || 0} tuples"></div>
+          <div class="slab-segment" style="width:${kamW}%;background:#06b6d4;" title="Kamailio Dialogs (Space 514): ${sb.kam_dialogs || 0} tuples"></div>
+          <div class="slab-segment" style="width:${epW}%;background:#a855f7;" title="PJSIP Endpoints (Space 520): ${sb.ps_endpoints || 0} tuples"></div>
+          <div class="slab-segment" style="width:${astW}%;background:#10b981;" title="Asterisk CDRs (Space 523): ${sb.asterisk_cdrs || 0} tuples"></div>
+          <div class="slab-segment" style="width:${subW}%;background:#f59e0b;" title="Subscribers (Space 516): ${sb.subscribers || 0} tuples"></div>
+        `;
+        document.getElementById('slab-footer-info').innerHTML = `
+          <span>Active Spaces: 9 (Memtx Slab)</span>
+          <span>Alloc Arena: ${d.stats.arena_size_mb || 512} MB &bull; Live Used: <strong>${d.stats.arena_used_mb || '3.63'} MB</strong></span>
+        `;
+      }
 
       const sBody = document.getElementById('subs-body');
       sBody.innerHTML = d.subscribers.map(s => `
