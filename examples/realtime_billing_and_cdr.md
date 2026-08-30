@@ -11,34 +11,56 @@ In legacy VoIP deployments, state is fragmented across multiple independent data
 2. **SQL Database (PostgreSQL / MySQL)**: Subscriber profiles, account balances, tariff matrices.
 3. **Batch Log Aggregators (Filebeats / ClickHouse)**: Delayed post-call CDR processing and billing.
 
-```
-                     ┌─────────────────────────────────────────────────────────┐
-                     │          LEGACY ARCHITECTURE (3 DISPARATE TIERS)       │
-                     └─────────────────────────────────────────────────────────┘
-[ SIP INVITE ] ──> Kamailio ──> Redis (Dialogs) ──> PostgreSQL (Balance & Tariffs) ──> Network Jitter
-[ SIP BYE ]    ──> RTPEngine ──> Log Files ──(5-min ETL)──> ClickHouse (CDR Ingestion)
+### 1. Call Setup & Authorization Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Caller as 📱 Caller
+    participant Kam as ⚡ Kamailio / OpenSIPS
+    participant TNT as 🔥 Tarantool 3.x (Memtx)
+    participant RTPE as 🎙️ RTPEngine
+
+    Caller->>Kam: SIP INVITE (From: Alice, To: +1202...)
+    activate Kam
+    Kam->>TNT: IProto: billing_authorize_call(caller, callee, call_id)
+    activate TNT
+    Note over TNT: Atomic Lua TX (< 0.2 ms):<br/>1. Check balance & limits (subscribers)<br/>2. Match prefix rate (tariffs: $0.02/min)<br/>3. Compute max duration credit<br/>4. Store active dialog (kam_dialogs)
+    TNT-->>Kam: { allowed: true, max_duration: 75000s, rate: 0.02 }
+    deactivate TNT
+    Kam->>RTPE: NG offer (allocate RTP relay ports)
+    RTPE-->>Kam: 200 OK + SDP media ports
+    Kam-->>Caller: 180 Ringing / 200 OK (Call Established)
+    deactivate Kam
 ```
 
-### The Unified Tarantool Advantage:
-With `ndb_tarantool`, `cachedb_tarantool`, and `rtpengine_tarantool`, all state operations run inside **one shared in-memory transactional database** with sub-millisecond stored procedures:
+### 2. Call Teardown, Rating & Instant CDR Finalization
 
-```
-                     ┌─────────────────────────────────────────────────────────┐
-                     │         UNIFIED TARANTOOL 3.x IN-MEMORY ARCHITECTURE    │
-                     └─────────────────────────────────────────────────────────┘
-[ SIP INVITE ] ──> Kamailio ──(1 RPC: billing_authorize_call)──> Tarantool 3.x (Memtx)
-                                                                    │
-   ┌────────────────────────────────────────────────────────────────┴──────────────────────────────────────────┐
-   │ In ONE atomic transaction (< 0.2 ms):                                                                     │
-   │ 1. Verify Subscriber Balance & Anti-Fraud limits (space: subscribers)                                     │
-   │ 2. Match Longest Destination Prefix & Rate (space: tariffs)                                               │
-   │ 3. Calculate Maximum Allowed Call Duration & Credit Limit                                                 │
-   │ 4. Register Dialog State & Reservation (space: kam_dialogs)                                               │
-   └────────────────────────────────────────────────────────────────┬──────────────────────────────────────────┘
-                                                                    │
-[ SIP BYE ]    ──> RTPEngine ──(1 RPC: billing_finalize_cdr)────────┴──> 1. Atomically deduct balance
-                                                                         2. Insert rich CDR with MOS, Jitter, Loss
-                                                                         3. Instant availability for Grafana/BI
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Caller as 📱 Caller
+    participant Kam as ⚡ Kamailio / OpenSIPS
+    participant RTPE as 🎙️ RTPEngine
+    participant TNT as 🔥 Tarantool 3.x (Memtx)
+    participant BI as 📊 Live Dashboard / Grafana
+
+    Caller->>Kam: SIP BYE (End Call)
+    activate Kam
+    Kam->>RTPE: NG delete (retrieve audio quality stats)
+    activate RTPE
+    RTPE-->>Kam: { duration: 185s, mos: 4.42, jitter: 1.15ms, loss: 0.02% }
+    deactivate RTPE
+    Kam->>TNT: IProto: billing_finalize_cdr(call_id, 185, stats)
+    activate TNT
+    Note over TNT: Atomic Lua Teardown TX:<br/>1. Calculate exact cost ($0.08)<br/>2. Debit balance: $25.00 -> $24.92<br/>3. Insert CDR enriched with MOS 4.42<br/>4. Evict active dialog
+    TNT-->>Kam: { status: "ok", billed: 0.08, remaining_balance: 24.92 }
+    deactivate TNT
+    Kam-->>Caller: 200 OK
+    deactivate Kam
+
+    BI->>TNT: billing_get_live_stats()
+    TNT-->>BI: Real-Time Fleet Revenue & Average MOS (Zero lock on SIP)
 ```
 
 ---
