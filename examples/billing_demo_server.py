@@ -55,8 +55,7 @@ def sampler_loop():
                     tnt_s.sendall(eval_pkt)
                     tnt_s.recv(64)
                     t1 = time.perf_counter()
-                    # Bound local execution to real socket IProto response
-                    tnt_ms = min(round((t1 - t0) * 1000, 3), 0.120)
+                    tnt_ms = round((t1 - t0) * 1000, 3)
                 except Exception:
                     try: tnt_s.close()
                     except Exception: pass
@@ -90,8 +89,8 @@ def sampler_loop():
             with telemetry_lock:
                 telemetry_history.append({
                     "time": time.time(),
-                    "tnt_ms": max(0.045, tnt_ms),
-                    "redis_ms": max(0.080, redis_ms)
+                    "tnt_ms": tnt_ms,
+                    "redis_ms": redis_ms
                 })
         except Exception:
             pass
@@ -672,13 +671,13 @@ function drawOscilloscope() {
   }
   ctx.stroke();
 
-  // Draw Tarantool line (Green) - Rock-solid sub-millisecond bounded WAL latency
+  // Draw Tarantool line (Green) - Pure Raw Socket Latency
   ctx.strokeStyle = '#10b981';
   ctx.lineWidth = 2.5;
   ctx.beginPath();
   for (let i = 0; i < liveTelemetry.length; i++) {
     const x = 35 + (i / (liveTelemetry.length - 1)) * (w - 40);
-    const ms = Math.min(liveTelemetry[i].tnt_ms, 0.15); // Tarantool stays stable < 0.15ms
+    const ms = liveTelemetry[i].tnt_ms;
     const y = h - (ms / maxMs) * (h - 25) - 10;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
