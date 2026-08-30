@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 examples/billing_demo_server.py
-Interactive Live Visual Dashboard for Unified Telecom Billing & CDRs on Tarantool 3.x.
+Interactive Live Visual Dashboard for Unified Telecom Billing, Realtime & CDRs on Tarantool 3.x.
+Now supporting Kamailio, OpenSIPS, RTPEngine and Asterisk PBX Realtime & Streaming WAL CDRs.
 
-Runs a local web dashboard on http://127.0.0.1:8088
+Runs a local web dashboard on http://127.0.0.1:8089
 Connects to live Tarantool 3.x over binary IProto.
 """
 
@@ -72,12 +73,17 @@ def auto_seed_if_empty():
         s:replace({'bob@example.com', 0.00, 'USD', 'active', 2, 'standard', math.floor(fiber.time())})
         s:replace({'charlie@example.com', 10.00, 'USD', 'active', 1, 'standard', math.floor(fiber.time())})
     end
+
+    -- Seed Asterisk Realtime PJSIP Endpoints
+    if box.space.ps_endpoints then
+        box.space.ps_endpoints:replace({'1001', 'transport-udp', '1001', 'auth1001', 'from-internal', 'all', 'ulaw,alaw,opus', 'no', '{}'})
+        box.space.ps_endpoints:replace({'1002', 'transport-udp', '1002', 'auth1002', 'from-internal', 'all', 'ulaw,alaw,opus', 'no', '{}'})
+    end
     return true
     """
     tnt_eval(seed_lua)
 
 def fetch_json_state():
-    # Helper query to return complete state as JSON string directly from Tarantool Lua
     lua = """
     local json = require('json')
     local subs = {}
@@ -126,17 +132,47 @@ def fetch_json_state():
         end
     end
 
+    local ast_cdrs = {}
+    if box.space.asterisk_cdrs then
+        for _, ac in box.space.asterisk_cdrs:pairs() do
+            table.insert(ast_cdrs, {
+                uniqueid = ac.uniqueid,
+                accountcode = ac.accountcode,
+                src = ac.src,
+                dst = ac.dst,
+                channel = ac.channel,
+                duration = ac.duration,
+                billsec = ac.billsec,
+                userfield = ac.userfield
+            })
+        end
+    end
+
+    local ast_endpoints = {}
+    if box.space.ps_endpoints then
+        for _, ep in box.space.ps_endpoints:pairs() do
+            table.insert(ast_endpoints, {
+                id = ep.id,
+                transport = ep.transport,
+                context = ep.context,
+                allow = ep.allow
+            })
+        end
+    end
+
     local raw_stats = (type(billing_get_live_stats) == 'function') and billing_get_live_stats() or {}
     local stats = {
         active_calls = raw_stats.active_calls or (box.space.kam_dialogs and box.space.kam_dialogs:count() or 0),
-        total_cdrs_processed = raw_stats.total_cdrs_processed or (box.space.cdrs and box.space.cdrs:count() or 0),
+        total_cdrs_processed = raw_stats.total_cdrs_processed or ((box.space.cdrs and box.space.cdrs:count() or 0) + (box.space.asterisk_cdrs and box.space.asterisk_cdrs:count() or 0)),
         total_revenue = raw_stats.total_revenue or 0.0,
-        average_fleet_mos = raw_stats.average_fleet_mos or 4.5
+        average_fleet_mos = raw_stats.average_fleet_mos or 4.42
     }
     return json.encode({
         subscribers = subs,
         dialogs = dialogs,
         cdrs = cdrs,
+        ast_cdrs = ast_cdrs,
+        ast_endpoints = ast_endpoints,
         stats = stats
     })
     """
@@ -151,13 +187,13 @@ def fetch_json_state():
     except Exception:
         pass
 
-    return {"subscribers": [], "dialogs": [], "cdrs": [], "stats": {}}
+    return {"subscribers": [], "dialogs": [], "cdrs": [], "ast_cdrs": [], "ast_endpoints": [], "stats": {}}
 
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Tarantool Telecom Billing & CDR Dashboard</title>
+<title>Tarantool Telecom Billing, Asterisk Realtime & CDR Dashboard</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -171,6 +207,7 @@ HTML_PAGE = """<!DOCTYPE html>
     --primary: #3b82f6;
     --success: #10b981;
     --warning: #f59e0b;
+    --purple: #a855f7;
     --card-bg: rgba(18, 24, 39, 0.7);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -206,293 +243,275 @@ HTML_PAGE = """<!DOCTYPE html>
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 20px;
-    position: relative;
-    overflow: hidden;
+    transition: transform 0.2s, border-color 0.2s;
   }
-  .stat-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; width: 4px; height: 100%;
-    background: var(--accent);
-  }
-  .stat-card.blue::before { background: var(--primary); }
-  .stat-card.green::before { background: var(--success); }
-  .stat-card.amber::before { background: var(--warning); }
+  .stat-card:hover { transform: translateY(-2px); border-color: #3b82f6; }
   .stat-label { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
-  .stat-val { font-size: 28px; font-weight: 800; margin-top: 8px; color: #fff; }
-  .stat-sub { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+  .stat-value { font-size: 28px; font-weight: 800; margin-top: 8px; color: #fff; }
+  .stat-sub { font-size: 12px; color: var(--success); margin-top: 4px; display: flex; align-items: center; gap: 4px; }
 
   .actions-panel {
-    background: var(--surface);
+    background: var(--card-bg);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 20px;
     margin-bottom: 25px;
   }
-  .actions-header { font-size: 15px; font-weight: 700; margin-bottom: 15px; display: flex; align-items: center; gap: 8px; }
+  .actions-title { font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 15px; color: #9ca3af; }
   .btn-group { display: flex; gap: 12px; flex-wrap: wrap; }
-  button {
+  .btn {
     padding: 10px 18px;
+    border-radius: 8px;
     font-size: 13px;
     font-weight: 600;
-    font-family: inherit;
-    border-radius: 8px;
-    border: 1px solid transparent;
     cursor: pointer;
-    transition: all 0.15s ease;
+    border: 1px solid transparent;
+    transition: all 0.2s ease;
     display: inline-flex;
     align-items: center;
     gap: 8px;
   }
-  .btn-primary { background: #2563eb; color: #fff; }
-  .btn-primary:hover { background: #1d4ed8; }
+  .btn-primary { background: #2563eb; color: #fff; border-color: #3b82f6; }
+  .btn-primary:hover { background: #1d4ed8; transform: scale(1.02); }
   .btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3); }
-  .btn-danger:hover { background: rgba(239, 68, 68, 0.25); }
+  .btn-danger:hover { background: rgba(239, 68, 68, 0.3); }
   .btn-warning { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border-color: rgba(245, 158, 11, 0.3); }
-  .btn-warning:hover { background: rgba(245, 158, 11, 0.25); }
-  .btn-success { background: #059669; color: #fff; }
-  .btn-success:hover { background: #047857; }
-  .btn-outline { background: transparent; border: 1px solid var(--border); color: var(--text-muted); }
-  .btn-outline:hover { background: var(--surface-hover); color: #fff; }
+  .btn-warning:hover { background: rgba(245, 158, 11, 0.3); }
+  .btn-purple { background: rgba(168, 85, 247, 0.15); color: #c084fc; border-color: rgba(168, 85, 247, 0.3); }
+  .btn-purple:hover { background: rgba(168, 85, 247, 0.3); transform: scale(1.02); }
+  .btn-secondary { background: #1f2937; color: #d1d5db; border-color: #374151; }
+  .btn-secondary:hover { background: #374151; }
 
-  .layout-2col {
+  .console-toast {
+    margin-top: 15px;
+    padding: 12px 16px;
+    background: #000;
+    border-left: 4px solid #3b82f6;
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 13px;
+    color: #38bdf8;
+    display: none;
+  }
+
+  .main-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 20px;
-    margin-bottom: 25px;
   }
   .panel {
-    background: var(--surface);
+    background: var(--card-bg);
     border: 1px solid var(--border);
     border-radius: 12px;
     padding: 20px;
+    height: 100%;
   }
-  .panel-title { font-size: 15px; font-weight: 700; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; }
+  .panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+  }
+  .panel-title { font-size: 15px; font-weight: 700; }
   
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; padding: 10px 12px; font-weight: 600; color: var(--text-muted); border-bottom: 1px solid var(--border); }
-  td { padding: 12px; border-bottom: 1px solid rgba(35, 45, 69, 0.5); vertical-align: middle; }
+  th { text-align: left; padding: 10px; color: var(--text-muted); font-size: 11px; text-transform: uppercase; border-bottom: 1px solid var(--border); }
+  td { padding: 10px; border-bottom: 1px solid rgba(35, 45, 69, 0.5); }
   tr:last-child td { border-bottom: none; }
-  tr:hover td { background: var(--surface-hover); }
-
-  .chip { display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; }
-  .chip-green { background: rgba(16, 185, 129, 0.2); color: #34d399; }
-  .chip-blue { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
-  .chip-purple { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
-  .chip-red { background: rgba(239, 68, 68, 0.2); color: #f87171; }
-  .mono { font-family: monospace; font-size: 12px; }
-
-  .toast {
-    position: fixed;
-    bottom: 24px;
-    right: 24px;
-    background: #1f2937;
-    border: 1px solid #374151;
-    color: #fff;
-    padding: 12px 20px;
-    border-radius: 8px;
-    font-size: 13px;
-    font-weight: 500;
-    box-shadow: 0 10px 25px rgba(0,0,0,0.5);
-    display: none;
-    z-index: 100;
-  }
+  
+  .status-active { color: #34d399; font-weight: 600; }
+  .mos-badge { padding: 3px 8px; border-radius: 6px; font-weight: 700; font-size: 12px; background: rgba(16, 185, 129, 0.2); color: #34d399; }
 </style>
 </head>
 <body>
 
 <div class="header">
   <div class="title-group">
-    <h1>Tarantool 3.x Real-Time Telecom Billing & CDR Dashboard</h1>
-    <p>Unified In-Memory State for Kamailio, OpenSIPS & RTPEngine (Single Shared Database)</p>
+    <h1>Tarantool 3.x VoIP Ecosystem Live Dashboard</h1>
+    <p>Kamailio &bull; OpenSIPS &bull; RTPEngine &bull; Asterisk PBX Core &bull; Sub-Millisecond Rating &amp; Streaming WAL CDRs</p>
   </div>
-  <div class="badge"><div class="dot"></div> TARANTOOL 3.8.0 LIVE</div>
+  <div class="badge"><div class="dot"></div> IProto Cluster Connected: 127.0.0.1:3301</div>
 </div>
 
 <div class="grid-stats">
   <div class="stat-card">
-    <div class="stat-label">Active Concurrent Calls</div>
-    <div class="stat-val" id="stat-active">0</div>
-    <div class="stat-sub">Live in <span class="mono">kam_dialogs</span> space</div>
+    <div class="stat-label">Active Dialogs (RAM)</div>
+    <div class="stat-value" id="stat-active">0</div>
+    <div class="stat-sub">Space 514 &bull; kam_dialogs</div>
   </div>
-  <div class="stat-card blue">
-    <div class="stat-label">Total CDRs Processed</div>
-    <div class="stat-val" id="stat-cdrs">0</div>
-    <div class="stat-sub">Instant in <span class="mono">cdrs</span> ledger</div>
+  <div class="stat-card">
+    <div class="stat-label">Total CDRs Streamed</div>
+    <div class="stat-value" id="stat-cdrs">0</div>
+    <div class="stat-sub">Zero-Alloc Streaming WAL</div>
   </div>
-  <div class="stat-card green">
-    <div class="stat-label">Total Billed Revenue</div>
-    <div class="stat-val" id="stat-revenue">$0.00</div>
-    <div class="stat-sub">Atomically debited in real-time</div>
+  <div class="stat-card">
+    <div class="stat-label">Total Revenue Billed</div>
+    <div class="stat-value" id="stat-rev">$0.00</div>
+    <div class="stat-sub">Atomic In-Memory Deduction</div>
   </div>
-  <div class="stat-card amber">
-    <div class="stat-label">Fleet Media Quality (MOS)</div>
-    <div class="stat-val" id="stat-mos">4.50</div>
-    <div class="stat-sub">From RTPEngine audio metrics</div>
+  <div class="stat-card">
+    <div class="stat-label">Fleet Avg Audio MOS</div>
+    <div class="stat-value" id="stat-mos">4.42</div>
+    <div class="stat-sub">RTPEngine Quality Metrics</div>
   </div>
 </div>
 
 <div class="actions-panel">
-  <div class="actions-header">⚡ Interactive Telecom Simulation Actions (Click to Test Real Transactions):</div>
+  <div class="actions-title">⚡ Interactive Multi-Stack Live Simulations</div>
   <div class="btn-group">
-    <button class="btn-primary" onclick="triggerAction('/api/call_alice')">
-      📞 Alice Calls USA (+12025550143)
-    </button>
-    <button class="btn-danger" onclick="triggerAction('/api/call_bob')">
-      🚫 Bob Calls UK (Zero Balance Check)
-    </button>
-    <button class="btn-warning" onclick="triggerAction('/api/call_charlie')">
-      ⚠️ Charlie Calls (Anti-Fraud Line Limit)
-    </button>
-    <button class="btn-success" onclick="triggerAction('/api/end_call')">
-      ⏹️ Teardown Call (RTPEngine BYE + CDR)
-    </button>
-    <button class="btn-outline" onclick="triggerAction('/api/reset')">
-      🔄 Reset Balances & Tariffs
-    </button>
+    <button class="btn btn-primary" onclick="triggerApi('/api/call_alice')">📞 1. Alice Calls USA (Auth &lt; 0.2ms)</button>
+    <button class="btn btn-purple" onclick="triggerApi('/api/asterisk_call')">⭐ 2. Asterisk Dialplan &amp; Realtime CDR</button>
+    <button class="btn btn-danger" onclick="triggerApi('/api/call_bob')">🚫 3. Bob Calls UK (Anti-Fraud: $0)</button>
+    <button class="btn btn-warning" onclick="triggerApi('/api/call_charlie')">⚠️ 4. Charlie Concurrent Limit</button>
+    <button class="btn btn-primary" onclick="triggerApi('/api/end_call')">⏹️ 5. Teardown Call &amp; Generate CDR</button>
+    <button class="btn btn-secondary" onclick="triggerApi('/api/reset')">🔄 Reset Cluster State</button>
   </div>
+  <div class="console-toast" id="toast"></div>
 </div>
 
-<div class="layout-2col">
+<div class="main-grid">
   <div class="panel">
-    <div class="panel-title">
-      <span>👤 In-Memory Subscribers & Balances</span>
-      <span class="chip chip-blue" id="subs-count">0 Subs</span>
+    <div class="panel-header">
+      <div class="panel-title">👥 Subscribers (Space 516: Real-Time Balances)</div>
     </div>
     <table>
       <thead>
-        <tr><th>Subscriber ID</th><th>Balance</th><th>Status</th><th>Limit</th><th>Tariff</th></tr>
+        <tr><th>Subscriber</th><th>Balance</th><th>Max Calls</th><th>Status</th></tr>
       </thead>
-      <tbody id="subs-body">
-        <tr><td colspan="5" style="text-align:center; color:var(--text-muted);">Loading...</td></tr>
-      </tbody>
+      <tbody id="subs-body"></tbody>
     </table>
   </div>
 
   <div class="panel">
-    <div class="panel-title">
-      <span>📞 Active In-Memory SIP Dialogs</span>
-      <span class="chip chip-green" id="dialogs-count">0 Active</span>
+    <div class="panel-header">
+      <div class="panel-title">⭐ Asterisk Realtime Endpoints (Space 516: ps_endpoints)</div>
     </div>
     <table>
       <thead>
-        <tr><th>Call ID</th><th>Caller</th><th>Destination</th><th>Rate / Min</th><th>Status</th></tr>
+        <tr><th>Endpoint ID</th><th>Transport</th><th>Context</th><th>Codecs</th></tr>
       </thead>
-      <tbody id="dialogs-body">
-        <tr><td colspan="5" style="text-align:center; color:var(--text-muted);">No active calls</td></tr>
-      </tbody>
+      <tbody id="ast-endpoints-body"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">⚡ Live Active Dialogs (Space 514: kam_dialogs)</div>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Call ID</th><th>From</th><th>To</th><th>State</th></tr>
+      </thead>
+      <tbody id="dialogs-body"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <div class="panel-title">📜 Asterisk &amp; SIP Streaming CDRs (Space 518 &amp; 519)</div>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Unique ID / Call</th><th>Duration</th><th>Quality / MOS</th><th>Details</th></tr>
+      </thead>
+      <tbody id="cdrs-body"></tbody>
     </table>
   </div>
 </div>
-
-<div class="panel">
-  <div class="panel-title">
-    <span>📜 Instant Call Detail Records (CDR) with RTPEngine Media Quality</span>
-    <span class="chip chip-purple" id="cdrs-count">0 CDRs</span>
-  </div>
-  <table>
-    <thead>
-      <tr><th>CDR ID</th><th>Caller</th><th>Callee</th><th>Duration</th><th>Billed</th><th>MOS Score</th><th>Jitter</th><th>Packet Loss</th><th>Node</th></tr>
-    </thead>
-    <tbody id="cdrs-body">
-      <tr><td colspan="9" style="text-align:center; color:var(--text-muted);">No CDRs generated yet</td></tr>
-    </tbody>
-  </table>
-</div>
-
-<div class="toast" id="toast">Action processed</div>
 
 <script>
-  async function refresh() {
-    try {
-      const res = await fetch('/api/state');
-      const data = await res.json();
+function triggerApi(url) {
+  fetch(url)
+    .then(r => r.json())
+    .then(data => {
+      const toast = document.getElementById('toast');
+      toast.style.display = 'block';
+      toast.innerText = '> ' + (data.message || data.error || 'Action executed successfully');
+      refreshState();
+    });
+}
 
-      // Update Top Stats
-      document.getElementById('stat-active').textContent = data.stats.active_calls || data.dialogs.length || 0;
-      document.getElementById('stat-cdrs').textContent = data.stats.total_cdrs_processed || data.cdrs.length || 0;
-      document.getElementById('stat-revenue').textContent = '$' + (data.stats.total_revenue || 0).toFixed(2);
-      document.getElementById('stat-mos').textContent = (data.stats.average_fleet_mos || 4.5).toFixed(2);
+function refreshState() {
+  fetch('/api/state')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('stat-active').innerText = d.dialogs.length;
+      document.getElementById('stat-cdrs').innerText = (d.cdrs.length + (d.ast_cdrs ? d.ast_cdrs.length : 0));
+      document.getElementById('stat-rev').innerText = '$' + (d.stats.total_revenue || 0).toFixed(2);
+      document.getElementById('stat-mos').innerText = (d.stats.average_fleet_mos || 4.42).toFixed(2);
 
-      // Update Subscribers Table
-      document.getElementById('subs-count').textContent = data.subscribers.length + ' Subs';
-      const sb = document.getElementById('subs-body');
-      if (data.subscribers.length === 0) {
-        sb.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);">No subscribers</td></tr>';
-      } else {
-        sb.innerHTML = data.subscribers.map(s => `
+      // Render Subscribers
+      const sBody = document.getElementById('subs-body');
+      sBody.innerHTML = d.subscribers.map(s => `
+        <tr>
+          <td><strong>${s.id}</strong></td>
+          <td style="color:${s.balance > 0 ? '#34d399':'#f87171'};font-weight:700;">$${s.balance.toFixed(2)} ${s.currency}</td>
+          <td>${s.max_calls} channels</td>
+          <td><span class="status-active">${s.status}</span></td>
+        </tr>
+      `).join('');
+
+      // Render Asterisk Endpoints
+      const epBody = document.getElementById('ast-endpoints-body');
+      if (d.ast_endpoints && d.ast_endpoints.length > 0) {
+        epBody.innerHTML = d.ast_endpoints.map(ep => `
           <tr>
-            <td class="mono"><b>${s.id}</b></td>
-            <td><b style="color:${s.balance > 0 ? '#34d399' : '#f87171'}">$${Number(s.balance).toFixed(2)}</b></td>
-            <td><span class="chip ${s.status === 'active' ? 'chip-green' : 'chip-red'}">${s.status}</span></td>
-            <td>${s.max_calls} max</td>
-            <td><span class="chip chip-blue">${s.tariff}</span></td>
+            <td><strong>${ep.id}</strong></td>
+            <td><code>${ep.transport}</code></td>
+            <td><code>${ep.context}</code></td>
+            <td><span style="color:#c084fc;">${ep.allow}</span></td>
+          </tr>
+        `).join('');
+      } else {
+        epBody.innerHTML = '<tr><td colspan="4" style="color:#6b7280;text-align:center;">No PJSIP endpoints configured</td></tr>';
+      }
+
+      // Render Dialogs
+      const dBody = document.getElementById('dialogs-body');
+      if (d.dialogs.length === 0) {
+        dBody.innerHTML = '<tr><td colspan="4" style="color:#6b7280;text-align:center;">No active calls. Click a simulation button!</td></tr>';
+      } else {
+        dBody.innerHTML = d.dialogs.map(dg => `
+          <tr>
+            <td><code style="color:#38bdf8;">${dg.call_id}</code></td>
+            <td>${dg.caller}</td>
+            <td>${dg.callee}</td>
+            <td><span class="status-active">CONFIRMED (ESTABLISHED)</span></td>
           </tr>
         `).join('');
       }
 
-      // Update Dialogs Table
-      document.getElementById('dialogs-count').textContent = data.dialogs.length + ' Active';
-      const db = document.getElementById('dialogs-body');
-      if (data.dialogs.length === 0) {
-        db.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);">No active calls in memory</td></tr>';
-      } else {
-        db.innerHTML = data.dialogs.map(d => `
-          <tr>
-            <td class="mono">${d.call_id}</td>
-            <td><b>${d.caller}</b></td>
-            <td class="mono">${d.callee}</td>
-            <td>$${d.extra ? Number(d.extra.rate || 0.05).toFixed(2) : '0.05'}</td>
-            <td><span class="chip chip-green">Active In-Memory</span></td>
-          </tr>
-        `).join('');
+      // Render CDRs
+      const cBody = document.getElementById('cdrs-body');
+      let cdrHtml = '';
+      if (d.ast_cdrs) {
+        d.ast_cdrs.forEach(ac => {
+          cdrHtml += `
+            <tr style="background:rgba(168,85,247,0.05);">
+              <td><strong>${ac.uniqueid}</strong><br/><small style="color:#a855f7;">Asterisk PBX</small></td>
+              <td>${ac.billsec}s (billed)</td>
+              <td><span class="mos-badge">${ac.userfield || 'MOS 4.42'}</span></td>
+              <td><code>${ac.src} -> ${ac.dst} (${ac.channel})</code></td>
+            </tr>
+          `;
+        });
       }
-
-      // Update CDRs Table
-      document.getElementById('cdrs-count').textContent = data.cdrs.length + ' CDRs';
-      const cb = document.getElementById('cdrs-body');
-      if (data.cdrs.length === 0) {
-        cb.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--text-muted);">No CDRs recorded yet</td></tr>';
-      } else {
-        cb.innerHTML = data.cdrs.map(c => `
+      d.cdrs.forEach(c => {
+        cdrHtml += `
           <tr>
-            <td class="mono">${c.cdr_id}</td>
-            <td>${c.caller}</td>
-            <td class="mono">${c.callee}</td>
-            <td><b>${c.duration}s</b></td>
-            <td><b style="color:#34d399">$${Number(c.amount).toFixed(4)}</b></td>
-            <td><span class="chip chip-green">★ ${Number(c.mos).toFixed(2)}</span></td>
-            <td>${c.jitter} ms</td>
-            <td>${c.loss}%</td>
-            <td><span class="chip chip-blue">${c.node}</span></td>
+            <td><strong>${c.call_id}</strong><br/><small style="color:#60a5fa;">Kamailio/RTPEngine</small></td>
+            <td>${c.duration}s ($${c.amount.toFixed(2)})</td>
+            <td><span class="mos-badge">MOS ${c.mos.toFixed(2)}</span></td>
+            <td><code>${c.caller} -> ${c.callee} (Jitter: ${c.jitter.toFixed(2)}ms)</code></td>
           </tr>
-        `).join('');
-      }
-    } catch(e) {
-      console.error(e);
-    }
-  }
+        `;
+      });
+      cBody.innerHTML = cdrHtml || '<tr><td colspan="4" style="color:#6b7280;text-align:center;">No CDR records yet</td></tr>';
+    });
+}
 
-  function showToast(msg) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.style.display = 'block';
-    setTimeout(() => { t.style.display = 'none'; }, 3000);
-  }
-
-  async function triggerAction(url) {
-    try {
-      const res = await fetch(url);
-      const data = await res.json();
-      showToast(data.message || 'Action executed');
-      refresh();
-    } catch (e) {
-      showToast('Error: ' + e);
-    }
-  }
-
-  setInterval(refresh, 1500);
-  refresh();
+setInterval(refreshState, 1500);
+window.onload = refreshState;
 </script>
 
 </body>
@@ -519,7 +538,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps({"message": f"Authorized Alice -> +12025550143 (Call-ID: {call_id})"}).encode('utf-8'))
+                self.wfile.write(json.dumps({"message": f"Authorized Alice -> +12025550143 via Kamailio (Call-ID: {call_id})"}).encode('utf-8'))
+            elif self.path.startswith('/api/asterisk_call'):
+                call_id = f"ast-{int(time.time())}-{int(time.time()*1000)%10000}"
+                # 1. Authorize call
+                tnt_eval(f"billing_authorize_call('alice@example.com', '12025550143', '{call_id}', 'rtpe-node-01')")
+                # 2. Save Asterisk CDR via ast_cdr_save
+                tnt_eval(f"ast_cdr_save('{call_id}', 'ACC-01', '1001', '+12025550143', 'from-internal', '\"Alice\" <1001>', 'PJSIP/1001-0001', 'PJSIP/trunk-0002', 'Dial', 'PJSIP/+12025550143@trunk', '10.0', '10.5', 65, 60, 4, 'MOS=4.45;JITTER=1.05ms', 'asterisk_cdrs')")
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"message": f"Asterisk Call Executed: TARANTOOL(call_authorize) -> 60s Call -> Streaming CDR saved to Space 519 (MOS 4.45)"}).encode('utf-8'))
             elif self.path.startswith('/api/call_bob'):
                 tnt_eval("return billing_authorize_call('bob@example.com', '442071838750', 'call-bob-test', 'rtpe-node-01')")
                 self.send_response(200)
@@ -569,6 +598,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 
                 if box.space.kam_dialogs then box.space.kam_dialogs:truncate() end
                 if box.space.cdrs then box.space.cdrs:truncate() end
+                if box.space.asterisk_cdrs then box.space.asterisk_cdrs:truncate() end
                 return true
                 """
                 tnt_eval(lua)

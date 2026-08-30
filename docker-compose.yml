@@ -95,6 +95,28 @@ services:
       voip_net:
         ipv4_address: 172.28.0.35
 
+  # 3c. Asterisk PBX Core с модулями Tarantool Realtime & CDR
+  asterisk:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.asterisk
+      args:
+        ASTERISK_REPO: https://github.com/lean1ee/asterisk.git
+        ASTERISK_BRANCH: feature/tarantool
+    container_name: ast_pbx
+    depends_on:
+      - tarantool
+      - rtpengine
+    environment:
+      - TARANTOOL_HOST=172.28.0.10
+      - TARANTOOL_PORT=3301
+    ports:
+      - "5080:5080/udp"
+      - "5080:5080/tcp"
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.38
+
   # 4. SIPp UAS (Bob / Принимающая сторона)
   sipp_uas:
     build:
