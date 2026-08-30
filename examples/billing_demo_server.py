@@ -163,7 +163,8 @@ def auto_seed_if_empty():
         box.space.cluster_nodes:replace({'rtpe-node-02', '172.28.0.31:22222', 'standby', 0, math.floor(fiber.time())})
     end
 
-    if box.space.rtpe_calls and box.space.rtpe_calls:count() == 0 then
+    if box.space.rtpe_calls then
+        box.space.rtpe_calls:truncate()
         for i = 1, 500 do
             box.space.rtpe_calls:replace({string.format('media-call-%04d', i), 'rtpe-node-01', 'active', math.floor(fiber.time()), math.floor(fiber.time()), math.floor(fiber.time()) + 3600, '{"codec":"opus","mos":4.45}'})
         end
