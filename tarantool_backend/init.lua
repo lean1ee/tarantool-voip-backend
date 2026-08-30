@@ -39,6 +39,13 @@ rawset(_G, 'rtpe_select_node', rtpe_service.select_optimal_node)
 rawset(_G, 'billing_authorize_call', billing_service.authorize_call)
 rawset(_G, 'billing_finalize_cdr', billing_service.finalize_cdr)
 rawset(_G, 'billing_get_live_stats', billing_service.get_live_stats)
+rawset(_G, 'voip_routing_lookup', function(sub_id, tariff_id, ep_id)
+    return {
+        box.space.subscribers and box.space.subscribers:get({sub_id or 'alice@example.com'}),
+        box.space.tariffs and box.space.tariffs:get({tariff_id or '1'}),
+        box.space.ps_endpoints and box.space.ps_endpoints:get({ep_id or '1001'})
+    }
+end)
 
 -- 3. Configure authentication users and permissions
 if not box.schema.user.exists('rtpe_user') then
