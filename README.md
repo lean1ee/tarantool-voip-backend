@@ -1,12 +1,13 @@
-# High-Performance Tarantool 3.x Backend for Kamailio, OpenSIPS & RTPEngine
+# High-Performance Tarantool 3.x Backend for Kamailio, OpenSIPS, RTPEngine & Asterisk
 
 [![Tarantool](https://img.shields.io/badge/Tarantool-3.x-blue.svg)](https://www.tarantool.io/)
 [![RTPEngine](https://img.shields.io/badge/RTPEngine-Sipwise-orange.svg)](https://github.com/lean1ee/rtpengine)
 [![Kamailio](https://img.shields.io/badge/Kamailio-SIP%20Server-green.svg)](https://github.com/lean1ee/kamailio)
 [![OpenSIPS](https://img.shields.io/badge/OpenSIPS-3.x-blueviolet.svg)](https://github.com/lean1ee/opensips)
+[![Asterisk](https://img.shields.io/badge/Asterisk-20%2F22%2Fmaster-red.svg)](https://github.com/lean1ee/asterisk)
 [![License](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](LICENSE)
 
-A carrier-grade, transactional in-memory clustering and media session synchronization solution for **RTPEngine**, **Kamailio**, and **OpenSIPS** powered by **Tarantool 3.x**. Designed as a drop-in, zero-jitter, low-latency replacement for Redis/KeyDB and P2P cache mesh backends.
+A carrier-grade, transactional in-memory clustering and media session synchronization solution for **RTPEngine**, **Kamailio**, **OpenSIPS**, and **Asterisk PBX** powered by **Tarantool 3.x**. Designed as a drop-in, zero-jitter, low-latency replacement for Redis/KeyDB, MySQL/ODBC, and P2P cache mesh backends.
 
 ---
 
@@ -17,6 +18,7 @@ A carrier-grade, transactional in-memory clustering and media session synchroniz
 | **Kamailio** | `kamailio/kamailio` | [**PR #4898**](https://github.com/kamailio/kamailio/pull/4898) | [lean1ee/kamailio (`feature/ndb_tarantool`)](https://github.com/lean1ee/kamailio/tree/feature/ndb_tarantool) | `src/modules/ndb_tarantool/` |
 | **OpenSIPS** | `OpenSIPS/opensips` | [**PR #4231**](https://github.com/OpenSIPS/opensips/pull/4231) | [lean1ee/opensips (`feature/cachedb_tarantool`)](https://github.com/lean1ee/opensips/tree/feature/cachedb_tarantool) | `modules/cachedb_tarantool/` |
 | **RTPEngine** | `sipwise/rtpengine` | [**PR #2163**](https://github.com/sipwise/rtpengine/pull/2163) | [lean1ee/rtpengine (`feature/tarantool`)](https://github.com/lean1ee/rtpengine/tree/feature/tarantool) | `daemon/tarantool.c` |
+| **Asterisk** | `asterisk/asterisk` | *Ready for Submission* | [lean1ee/asterisk (`feature/tarantool`)](https://github.com/lean1ee/asterisk/tree/feature/tarantool) | `res/`, `funcs/`, `cdr/` |
 | **Backend App** | `tarantool/tarantool` | *Standalone Hub* | [lean1ee/tarantool-voip-backend](https://github.com/lean1ee/tarantool-voip-backend) | `tarantool_backend/` |
 
 ---
@@ -47,10 +49,11 @@ flowchart TB
         UAC["<b>SIP User Agents (UAC / UAS)</b><br/><code>G.711 / Opus RTP Audio Streams</code><br/><i>SIPp Benchmarking Arm</i>"]
     end
 
-    subgraph Signaling["⚡ High-Throughput SIP Signaling Plane"]
+    subgraph Signaling["⚡ High-Throughput SIP Signaling & Applications Plane"]
         direction LR
         KAM["<b>Kamailio 6.x SIP Server</b><br/><code>mod ndb_tarantool</code><br/><i>• Async IProto Connection Pool<br/>• Native KEMI Lua / Python API</i>"]
         OS["<b>OpenSIPS 3.x SIP Server</b><br/><code>cachedb_tarantool</code><br/><i>• Official cachedb_funcs_t Driver<br/>• Zero-Alloc CACHEDB_CAP_GET_BUF</i>"]
+        AST["<b>Asterisk PBX Core</b><br/><code>res_config_tarantool</code><br/><i>• Realtime PJSIP / Sorcery Driver<br/>• Zero-Alloc Streaming CDRs</i>"]
     end
 
     subgraph Media["🎙️ Media Relay Layer"]
@@ -77,13 +80,16 @@ flowchart TB
 
     UAC ==>|"<b>SIP Signalling</b><br/><code>UDP: 5060 / 5070</code>"| KAM
     UAC ==>|"<b>SIP Signalling</b><br/><code>UDP: 5060 / 5070</code>"| OS
+    UAC ==>|"<b>SIP Signalling</b><br/><code>UDP: 5080</code>"| AST
     UAC <=====>|"<b>RTP/SRTP Media Streams</b><br/><code>UDP: 30000–40000</code>"| RTPE
 
     KAM -.->|"<b>NG Protocol</b> (offers/answers)<br/><code>UDP: 22222</code>"| RTPE
     OS -.->|"<b>NG Protocol</b> (offers/answers)<br/><code>UDP: 22222</code>"| RTPE
+    AST -.->|"<b>NG Protocol</b> (offers/answers)<br/><code>UDP: 22222</code>"| RTPE
 
     KAM ===>|"<b>Binary IProto (TCP: 3301)</b><br/><i>Pre-Call Auth &amp; Dialogs</i>"| Backend
     OS ===>|"<b>Binary IProto (TCP: 3301)</b><br/><i>CacheDB Key-Value &amp; RPC</i>"| Backend
+    AST ===>|"<b>Binary IProto (TCP: 3301)</b><br/><i>Realtime Objects &amp; CDRs</i>"| Backend
     RTPE ===>|"<b>Binary IProto (TCP: 3301)</b><br/><i>Active Calls &amp; CDR Finalize</i>"| Backend
 
     classDef tnt fill:#ef444415,stroke:#ef4444,stroke-width:2px,color:#f8fafc;
@@ -92,7 +98,7 @@ flowchart TB
     classDef client fill:#10b98115,stroke:#10b981,stroke-width:2px,color:#f8fafc;
     classDef space fill:#a855f720,stroke:#a855f7,stroke-width:2px,color:#f8fafc;
 
-    class KAM,OS sip;
+    class KAM,OS,AST sip;
     class RTPE media;
     class UAC client;
     class LUA1,LUA2,LUA3 tnt;

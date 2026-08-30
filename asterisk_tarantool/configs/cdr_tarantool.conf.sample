@@ -1,0 +1,13 @@
+;
+; Tarantool 3.x High-Speed CDR Engine Configuration
+;
+
+[general]
+; Connection profile name as defined in tarantool.conf (default: tnt1)
+connection = tnt1
+
+; Space name in Tarantool where CDRs should be stored (default: asterisk_cdrs)
+space = asterisk_cdrs
+
+; Record the unique channel identifier in CDRs (default: yes)
+log_uniqueid = yes

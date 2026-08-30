@@ -1,0 +1,7 @@
+{
+	global:
+		LINKER_SYMBOL_PREFIXast_tarantool_*;
+		LINKER_SYMBOL_PREFIX_ast_tarantool_*;
+	local:
+		*;
+};

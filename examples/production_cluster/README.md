@@ -1,4 +1,4 @@
-# Production Cluster Deployment: Kamailio / OpenSIPS + RTPEngine + Tarantool 3.x
+# Production Cluster Deployment: Kamailio / OpenSIPS + RTPEngine + Asterisk + Tarantool 3.x
 
 This directory contains battle-tested, production-ready configuration examples for deploying a carrier-grade VoIP media cluster backed by **Tarantool 3.x**.
 
@@ -6,10 +6,14 @@ This directory contains battle-tested, production-ready configuration examples f
 
 ```text
 examples/production_cluster/
-├── kamailio.cfg     # Production Kamailio SIP script with ndb_tarantool and rtpengine
-├── opensips.cfg     # Production OpenSIPS SIP script with cachedb_tarantool and rtpengine
-├── rtpengine.conf   # Production RTPEngine daemon config with IProto cluster driver
-└── README.md        # Deployment and operations manual
+├── kamailio.cfg        # Production Kamailio SIP script with ndb_tarantool and rtpengine
+├── opensips.cfg        # Production OpenSIPS SIP script with cachedb_tarantool and rtpengine
+├── rtpengine.conf      # Production RTPEngine daemon config with IProto cluster driver
+├── tarantool.conf      # Production Asterisk Tarantool connection pool configuration
+├── extconfig.conf      # Production Asterisk Realtime / Sorcery configuration
+├── cdr_tarantool.conf  # Production Asterisk streaming WAL CDR configuration
+├── extensions.conf     # Production Asterisk Dialplan with real-time pre-call rating
+└── README.md           # Deployment and operations manual
 ```
 
 ## Quickstart Guide
@@ -40,6 +44,13 @@ kamailio -f /etc/kamailio/kamailio.cfg -DD -E
 Copy `opensips.cfg` to `/etc/opensips/opensips.cfg` and launch OpenSIPS:
 ```bash
 opensips -f /etc/opensips/opensips.cfg -E
+```
+
+### 3. Option C: Configure and Start Asterisk
+
+Copy `tarantool.conf`, `extconfig.conf`, `cdr_tarantool.conf`, and `extensions.conf` to `/etc/asterisk/` and launch Asterisk:
+```bash
+asterisk -c -vvv
 ```
 
 ## Failover and High Availability

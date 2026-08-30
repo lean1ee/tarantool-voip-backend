@@ -22,11 +22,18 @@
 4. **`opensips_tarantool/` (Модуль для OpenSIPS)**
    - `cachedb_tarantool/`: Драйвер интерфейса `cachedb_funcs_t` для OpenSIPS 3.x с поддержкой `tarantool_call`, `tarantool_eval`, TCP keepalive и пула соединений.
 
-5. **`docker/` и `docker-compose.yml` (Тестовый полигон Docker)**
+5. **`asterisk_tarantool/` (Комплект модулей для Asterisk 20/22/master)**
+   - `res/res_tarantool.c`: Core IProto пул соединений, TCP keepalive, auto-reconnect и CLI команды.
+   - `res/res_config_tarantool.c`: Realtime-движок `ast_config_engine` (Sorcery, PJSIP объекты, статические .conf).
+   - `funcs/func_tarantool.c`: Функции диалплана `${TARANTOOL(...)}` и `${TARANTOOL_EVAL(...)}`.
+   - `cdr/cdr_tarantool.c`: Неблокирующий высокоскоростной логгер CDR в потоковый WAL.
+
+6. **`docker/` и `docker-compose.yml` (Тестовый полигон Docker)**
    - `docker/Dockerfile.rtpengine`: Образ RTPEngine с драйвером Tarantool (`lean1ee/rtpengine`).
    - `docker/Dockerfile.kamailio`: Образ Kamailio с модулем ndb_tarantool (`lean1ee/kamailio`).
    - `docker/Dockerfile.opensips`: Образ OpenSIPS с модулем cachedb_tarantool (`lean1ee/opensips`).
-   - `docker-compose.yml`: Топология кластера (Tarantool 3.x + Redis 8.x + RTPEngine + Kamailio + OpenSIPS).
+   - `docker/Dockerfile.asterisk`: Образ Asterisk с модулями Tarantool (`lean1ee/asterisk`).
+   - `docker-compose.yml`: Топология кластера (Tarantool 3.x + Redis 8.x + RTPEngine + Kamailio + OpenSIPS + Asterisk).
 
 6. **`tests/` (Интеграционный и бенчмарк стенд)**
    - `tests/run_full_matrix_benchmark.py`: Сравнительный матричный бенчмарк всех 4 связок (Kamailio / OpenSIPS + Tarantool / Redis).

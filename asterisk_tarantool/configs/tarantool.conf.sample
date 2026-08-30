@@ -1,0 +1,26 @@
+;
+; Tarantool 3.x Configuration for Asterisk
+;
+; This configuration file defines connection pools and endpoints for interacting
+; with Tarantool 3.x in-memory database instances over binary IProto protocol.
+;
+
+[general]
+; Global settings
+
+[tnt1]
+; Host IPv4/IPv6 or hostname of the Tarantool instance
+host = 127.0.0.1
+
+; Binary IProto port (default: 3301)
+port = 3301
+
+; Optional authentication username and password
+user = asterisk
+secret = secret123
+
+; Number of pre-allocated socket connections in pool (default: 4)
+pool_size = 8
+
+; Network query timeout in milliseconds (default: 500)
+timeout_ms = 500

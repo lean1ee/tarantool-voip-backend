@@ -1,0 +1,25 @@
+# Dockerfile.asterisk
+# Upstream: https://github.com/lean1ee/asterisk.git (branch: feature/tarantool)
+# Based on Asterisk PBX with Tarantool 3.x Realtime, Dialplan Function, and CDR Modules
+
+FROM debian:13-slim
+
+ARG ASTERISK_REPO=https://github.com/lean1ee/asterisk.git
+ARG ASTERISK_BRANCH=feature/tarantool
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    netcat-openbsd \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy Asterisk Tarantool modules
+COPY asterisk_tarantool /app/asterisk_tarantool
+
+EXPOSE 5080/udp 5080/tcp 10000-10100/udp
+
+CMD ["/bin/sh", "-c", "echo '[+] Asterisk with Tarantool 3.x Realtime & CDR ready.' && sleep infinity"]

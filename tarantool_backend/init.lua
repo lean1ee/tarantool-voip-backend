@@ -21,10 +21,12 @@ box.cfg {
 local schema = require('app.schema')
 local rtpe_service = require('app.rtpe_service')
 local billing_service = require('app.billing_service')
+local asterisk_service = require('app.asterisk_service')
 local ttl_worker = require('app.ttl_worker')
 
 -- 1. Initialize space formats and secondary indexes
 schema.init()
+asterisk_service.init()
 
 -- 2. Export global RPC stored procedures for direct IProto execution (box.call)
 rawset(_G, 'rtpe_call_upsert', rtpe_service.call_upsert)

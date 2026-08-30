@@ -43,12 +43,12 @@ python examples/billing_demo_server.py
 ---
 
 ### Feature 2: Full Unit & Integration Test Suite
-Executes all 13 automated test suites across IProto framing, schema indexes, TTL background cleanup, and billing logic:
+Executes all 18 automated test suites across IProto framing, schema indexes, TTL background cleanup, billing logic, and Asterisk Realtime/Dialplan/CDR drivers:
 
 ```bash
 python -m unittest discover -s tests
 ```
-*Expected output:* `Ran 13 tests in ~0.15s -> OK`.
+*Expected output:* `Ran 18 tests in ~0.18s -> OK`.
 
 ---
 
