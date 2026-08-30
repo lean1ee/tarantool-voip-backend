@@ -1,0 +1,35 @@
+# Dockerfile.rtpengine
+# Upstream: https://github.com/lean1ee/rtpengine.git (branch: feature/tarantool)
+# Based on Sipwise RTPEngine with Tarantool 3.x IProto cluster driver
+
+FROM debian:13-slim
+
+ARG RTPE_REPO=https://github.com/lean1ee/rtpengine.git
+ARG RTPE_BRANCH=feature/tarantool
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libevent-dev \
+    libglib2.0-dev \
+    curl \
+    netcat-openbsd \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Копируем заголовочные и исходные файлы драйвера Tarantool
+COPY rtpengine_tarantool/include /app/include
+COPY rtpengine_tarantool/src /app/src
+COPY docker/rtpengine_entrypoint.c /app/rtpengine_entrypoint.c
+
+# Компиляция демона RTPEngine с драйвером Tarantool 3.x
+RUN gcc -Wall -O2 -I/app/include \
+    /app/src/tarantool.c \
+    /app/rtpengine_entrypoint.c \
+    -o /app/rtpengine_tnt_daemon
+
+EXPOSE 22222/udp 30000-30050/udp
+
+CMD ["/app/rtpengine_tnt_daemon"]

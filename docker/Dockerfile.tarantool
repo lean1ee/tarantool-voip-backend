@@ -1,0 +1,65 @@
+# Dockerfile.tarantool
+# Upstream: https://github.com/tarantool/tarantool.git (release: 3.8.0 / 3.x)
+# In-Memory Database and Stored Procedure Engine for VoIP Sessions
+
+FROM debian:13-slim AS builder
+
+ARG TARANTOOL_VERSION=3.8.0
+ARG TARANTOOL_REPO=https://github.com/tarantool/tarantool.git
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    libreadline-dev \
+    libncurses-dev \
+    libssl-dev \
+    zlib1g-dev \
+    libunwind-dev \
+    libyaml-dev \
+    libicu-dev \
+    pkg-config \
+    ca-certificates \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Клонируем официальный релиз Tarantool 3.8 со всеми рекурсивными сабмодулями
+RUN git clone --depth 1 --branch ${TARANTOOL_VERSION} --recursive ${TARANTOOL_REPO} /build || \
+    git clone --depth 1 --recursive ${TARANTOOL_REPO} /build
+
+RUN cmake . \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DENABLE_DIST=ON \
+    -DENABLE_BACKTRACE=OFF \
+    -DENABLE_DOC=OFF \
+    -DENABLE_TESTS=OFF \
+    && make -j$(nproc) \
+    && make install
+
+FROM debian:13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreadline8t64 \
+    libncurses6 \
+    libssl3t64 \
+    zlib1g \
+    libunwind8 \
+    libyaml-0-2 \
+    libicu76 \
+    ca-certificates \
+    curl \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/bin/tarantool /usr/local/bin/tarantool
+COPY --from=builder /usr/local/include/tarantool /usr/local/include/tarantool
+
+WORKDIR /opt/tarantool
+COPY tarantool_backend /opt/tarantool
+
+EXPOSE 3301
+
+ENTRYPOINT ["tarantool"]
+CMD ["/opt/tarantool/init.lua"]

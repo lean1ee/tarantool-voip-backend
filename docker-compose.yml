@@ -1,0 +1,130 @@
+services:
+  # 1. Tarantool 3.x In-Memory бэкенд (компиляция из исходников 3.8.0)
+  tarantool:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tarantool
+      args:
+        TARANTOOL_VERSION: 3.8.0
+        TARANTOOL_REPO: https://github.com/tarantool/tarantool.git
+    container_name: tnt_backend
+    volumes:
+      - ./tarantool_backend:/opt/tarantool
+    environment:
+      - TARANTOOL_LISTEN=0.0.0.0:3301
+    ports:
+      - "3301:3301"
+    entrypoint: ["tarantool"]
+    command: ["/opt/tarantool/init.lua"]
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.10
+
+  # 1b. Redis бэкенд (компиляция из исходников 8.10.1)
+  redis:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.redis
+      args:
+        REDIS_VERSION: 8.10.1
+        REDIS_REPO: https://github.com/redis/redis.git
+    container_name: redis_backend
+    ports:
+      - "6379:6379"
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.15
+
+  # 2. Драйвер RTPEngine с поддержкой Tarantool
+  rtpengine:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.rtpengine
+      args:
+        RTPENGINE_REPO: https://github.com/lean1ee/rtpengine.git
+        RTPENGINE_BRANCH: feature/tarantool
+    container_name: rtpe_node1
+    depends_on:
+      - tarantool
+    environment:
+      - TARANTOOL_HOST=172.28.0.10
+      - TARANTOOL_PORT=3301
+      - NODE_ID=rtpe-node-01
+    ports:
+      - "22222:22222/udp"
+      - "30000-30200:30000-30200/udp"
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.20
+
+  # 3. Kamailio SIP Proxy с KEMI и модулем ndb_tarantool
+  kamailio:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.kamailio
+      args:
+        KAMAILIO_REPO: https://github.com/lean1ee/kamailio.git
+        KAMAILIO_BRANCH: feature/ndb_tarantool
+    container_name: kam_proxy
+    depends_on:
+      - tarantool
+      - rtpengine
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.30
+
+  # 3b. OpenSIPS Proxy с модулем cachedb_tarantool
+  opensips:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.opensips
+      args:
+        OPENSIPS_REPO: https://github.com/lean1ee/opensips.git
+        OPENSIPS_BRANCH: feature/cachedb_tarantool
+    container_name: opensips_proxy
+    depends_on:
+      - tarantool
+      - rtpengine
+    ports:
+      - "5070:5060/udp"
+      - "5070:5060/tcp"
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.35
+
+  # 4. SIPp UAS (Bob / Принимающая сторона)
+  sipp_uas:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sipp
+    container_name: sipp_uas_bob
+    depends_on:
+      - kamailio
+    command: ["-sf", "/sipp/uas.xml", "-p", "5080", "-i", "172.28.0.40", "-mp", "31000", "-m", "1000000", "-l", "1000"]
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.40
+
+  # 5. SIPp UAC (Alice / Генератор вызовов)
+  sipp_uac:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.sipp
+    container_name: sipp_uac_alice
+    depends_on:
+      - kamailio
+      - sipp_uas
+    command: ["-sf", "/sipp/uac.xml", "172.28.0.30:5060", "-s", "bob", "-i", "172.28.0.50", "-r", "10", "-m", "30", "-l", "15", "-mp", "32000"]
+    networks:
+      voip_net:
+        ipv4_address: 172.28.0.50
+
+networks:
+  voip_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

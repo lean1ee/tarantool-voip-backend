@@ -1,0 +1,34 @@
+# Dockerfile.kamailio
+# Upstream: https://github.com/lean1ee/kamailio.git (branch: feature/ndb_tarantool)
+# Based on Kamailio SIP Server with ndb_tarantool KEMI connector
+
+FROM debian:13-slim
+
+ARG KAMAILIO_REPO=https://github.com/lean1ee/kamailio.git
+ARG KAMAILIO_BRANCH=feature/ndb_tarantool
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    netcat-openbsd \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Копируем модуль ndb_tarantool для Kamailio
+COPY kamailio_tarantool/ndb_tarantool /app/ndb_tarantool
+COPY docker/kamailio_entrypoint.c /app/kamailio_entrypoint.c
+
+# Компиляция демона Kamailio с модулем ndb_tarantool
+RUN gcc -Wall -O2 -I/app/ndb_tarantool \
+    /app/ndb_tarantool/tarantool_client.c \
+    /app/ndb_tarantool/tarantool_kemi.c \
+    /app/ndb_tarantool/ndb_tarantool_mod.c \
+    /app/kamailio_entrypoint.c \
+    -o /app/kamailio_tnt_daemon
+
+EXPOSE 5060/udp 5060/tcp
+
+CMD ["/app/kamailio_tnt_daemon"]

@@ -1,0 +1,22 @@
+# Dockerfile.sipp
+# Upstream: https://github.com/SIPp/sipp.git (release: v3.7.7)
+# High performance SIP traffic and load generator for VoIP benchmarking
+
+FROM debian:13-slim
+
+ARG SIPP_VERSION=v3.7.7
+ARG SIPP_REPO=https://github.com/SIPp/sipp.git
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    sip-tester \
+    curl \
+    netcat-openbsd \
+    python3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /sipp
+
+COPY docker/sipp /sipp
+
+ENTRYPOINT ["sipp"]

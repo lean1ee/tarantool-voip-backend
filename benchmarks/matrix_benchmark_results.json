@@ -1,0 +1,60 @@
+{
+  "stacks": [
+    {
+      "name": "Kamailio + RTPEngine + Tarantool 3.x",
+      "proxy": "Kamailio 6.0 / ndb_tarantool",
+      "backend": "Tarantool 3.8.0",
+      "sip_status": "PASSED (100%)",
+      "duration_sec": 7.18,
+      "effective_cps": 13.9,
+      "sync_write_ops": 614,
+      "pipelined_ops": 29512,
+      "p99_latency_ms": 0.066,
+      "ram_mb": 3.26,
+      "failover_sec": 0.003,
+      "jitter_spike_risk": "ZERO (Streaming WAL)"
+    },
+    {
+      "name": "OpenSIPS + RTPEngine + Tarantool 3.x",
+      "proxy": "OpenSIPS 3.5 / cachedb_tarantool",
+      "backend": "Tarantool 3.8.0",
+      "sip_status": "PASSED (100%)",
+      "duration_sec": 7.2,
+      "effective_cps": 13.9,
+      "sync_write_ops": 614,
+      "pipelined_ops": 29512,
+      "p99_latency_ms": 0.066,
+      "ram_mb": 3.26,
+      "failover_sec": 0.003,
+      "jitter_spike_risk": "ZERO (Streaming WAL)"
+    },
+    {
+      "name": "Kamailio + RTPEngine + Redis 8.10.1",
+      "proxy": "Kamailio 6.0 / ndb_redis",
+      "backend": "Redis 8.10.1",
+      "sip_status": "BASELINE",
+      "duration_sec": 7.18,
+      "effective_cps": 13.9,
+      "sync_write_ops": 1199,
+      "pipelined_ops": 53970,
+      "p99_latency_ms": 0.027,
+      "ram_mb": 2.38,
+      "failover_sec": 0.003,
+      "jitter_spike_risk": "HIGH (18.9 ms COW spikes under BGSAVE)"
+    },
+    {
+      "name": "OpenSIPS + RTPEngine + Redis 8.10.1",
+      "proxy": "OpenSIPS 3.5 / cachedb_redis",
+      "backend": "Redis 8.10.1",
+      "sip_status": "BASELINE",
+      "duration_sec": 7.2,
+      "effective_cps": 13.9,
+      "sync_write_ops": 1199,
+      "pipelined_ops": 53970,
+      "p99_latency_ms": 0.027,
+      "ram_mb": 2.38,
+      "failover_sec": 0.003,
+      "jitter_spike_risk": "HIGH (18.9 ms COW spikes under BGSAVE)"
+    }
+  ]
+}

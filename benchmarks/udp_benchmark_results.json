@@ -1,0 +1,38 @@
+[
+  {
+    "service": "RTPEngine NG Protocol (UDP)",
+    "port": "22222/udp",
+    "total_packets": 10000,
+    "success": 10000,
+    "loss_rate": "0.00%",
+    "throughput_pps": 1782.5,
+    "p50_us": 508.7,
+    "p95_us": 809.5,
+    "p99_us": 1093.6,
+    "avg_us": 556.0
+  },
+  {
+    "service": "SIP Signaling Proxy (UDP)",
+    "port": "5060/udp",
+    "total_packets": 5000,
+    "success": 4950,
+    "loss_rate": "1.00%",
+    "throughput_pps": 177.1,
+    "p50_us": 526.9,
+    "p95_us": 728.9,
+    "p99_us": 1324.7,
+    "avg_us": 576.1
+  },
+  {
+    "service": "SIP Signaling Proxy (UDP)",
+    "port": "5060/udp",
+    "total_packets": 5000,
+    "success": 4999,
+    "loss_rate": "0.02%",
+    "throughput_pps": 1570.4,
+    "p50_us": 519.2,
+    "p95_us": 670.7,
+    "p99_us": 795.2,
+    "avg_us": 530.4
+  }
+]

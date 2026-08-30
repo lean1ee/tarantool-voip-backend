@@ -1,0 +1,247 @@
+diff --git a/bench/pcbench.c b/bench/pcbench.c
+index 4fe717d..fb2cec8 100644
+--- a/bench/pcbench.c
++++ b/bench/pcbench.c
+@@ -1,14 +1,15 @@
+ /*
+  * pcbench — dual-protocol cache bench client (task S10).
+  *
+- * ONE client, two wire protocols, so perfcached and Redis are measured
+- * through the same code path:
++ * ONE client, multiple wire protocols, so perfcached, Redis, and Tarantool
++ * are measured through the same code path:
+  *   -P perf   perfcached text dialect (newline JSON-RPC, plaintext)
+  *   -P bin    perfcached BINARY dialect (16B-header frames, raw values;
+  *             layouts in src/proto.h) - what libperfd opts.binary and
+  *             the OpenSIPS driver ride; measures the wire without the
+  *             JSON codec
+  *   -P resp   Redis RESP
++ *   -P tnt    Tarantool 3.x binary IProto dialect
+  *
+  * Each thread owns one connection and drives a fixed pipeline depth.
+  * Depth 1 records per-op RTT into a 1us-granularity histogram
+@@ -20,7 +21,7 @@
+  * "error" or a RESP -ERR counts as an error, and any error fails the
+  * run loudly - a bench that cannot fail is not a bench.
+  *
+- * usage: pcbench -h host -p port -P perf|resp [-C col] [-c conns]
++ * usage: pcbench -h host -p port -P perf|bin|resp|tnt [-C col] [-c conns]
+  *        [-d depth] [-n keys] [-v valsize] [-T secs] [-w warmup]
+  *        [-M getpct] [-F] (fill only) [-N] (skip the pre-GET fill: the
+  *        keyspace is known-filled - REQUIRED for reads through a
+@@ -40,6 +41,7 @@
+ #include <sys/socket.h>
+ #include <netinet/in.h>
+ #include <netinet/tcp.h>
++#include "msgpuck.h"
+ 
+ #define HIST_US 100000                 /* 1us buckets up to 100ms, then clamp */
+ 
+@@ -47,6 +49,7 @@ static const char *o_host = "127.0.0.1", *o_proto = "perf", *o_col = "b";
+ static int o_port = 6379, o_conns = 4, o_depth = 1, o_keys = 100000;
+ static int o_val = 64, o_secs = 10, o_warm = 2, o_getpct = 100;
+ static int o_fill_only = 0, o_quiet = 0, o_nofill = 0;
++static int is_perf, is_bin, is_tnt;
+ 
+ static volatile int t_stop;
+ static struct timespec t_warm_end;
+@@ -89,8 +92,21 @@ static int dial(void)
+ 		fd = -1;
+ 	}
+ 	freeaddrinfo(res);
+-	if (fd >= 0)
++	if (fd >= 0) {
+ 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
++		if (is_tnt) {
++			char greeting[128];
++			size_t tot = 0;
++			while (tot < 128) {
++				ssize_t g = read(fd, greeting + tot, 128 - tot);
++				if (g <= 0) {
++					close(fd);
++					return -1;
++				}
++				tot += (size_t)g;
++			}
++		}
++	}
+ 	return fd;
+ }
+ 
+@@ -110,8 +126,6 @@ static int send_all(int fd, const char *b, size_t n)
+ 
+ /* ---- request builders -------------------------------------------------- */
+ 
+-static int is_perf, is_bin;
+-
+ static void le16(unsigned char *b, unsigned int v)
+ {
+ 	b[0] = (unsigned char)v;
+@@ -164,6 +178,65 @@ static int build_req(char *dst, int get, unsigned int key, const char *val)
+ 		}
+ 		return (int)(16 + plen);
+ 	}
++
++	if (is_tnt) {
++		char *h_start = dst + 5;
++		char *p = h_start;
++		uint64_t sync_id = (uint64_t)(key + 1);
++
++		if (get) {
++			/* Header: Map(2) { 0x00: IPROTO_SELECT (1), 0x01: sync } */
++			p = mp_encode_map(p, 2);
++			p = mp_encode_uint(p, 0x00); /* IPROTO_REQUEST_TYPE */
++			p = mp_encode_uint(p, 0x01); /* IPROTO_SELECT */
++			p = mp_encode_uint(p, 0x01); /* IPROTO_SYNC */
++			p = mp_encode_uint(p, sync_id);
++
++			/* Body: Map(6) { 0x10: space 512, 0x11: index 0, 0x12: limit 1, 0x13: offset 0, 0x14: iter 0, 0x20: [key] } */
++			p = mp_encode_map(p, 6);
++			p = mp_encode_uint(p, 0x10); /* IPROTO_SPACE_ID */
++			p = mp_encode_uint(p, 512);
++			p = mp_encode_uint(p, 0x11); /* IPROTO_INDEX_ID */
++			p = mp_encode_uint(p, 0);
++			p = mp_encode_uint(p, 0x12); /* IPROTO_LIMIT */
++			p = mp_encode_uint(p, 1);
++			p = mp_encode_uint(p, 0x13); /* IPROTO_OFFSET */
++			p = mp_encode_uint(p, 0);
++			p = mp_encode_uint(p, 0x14); /* IPROTO_ITERATOR */
++			p = mp_encode_uint(p, 0);
++			p = mp_encode_uint(p, 0x20); /* IPROTO_KEY */
++			p = mp_encode_array(p, 1);
++			p = mp_encode_str(p, kb, (uint32_t)kl);
++		} else {
++			/* Header: Map(2) { 0x00: IPROTO_REPLACE (3), 0x01: sync } */
++			p = mp_encode_map(p, 2);
++			p = mp_encode_uint(p, 0x00); /* IPROTO_REQUEST_TYPE */
++			p = mp_encode_uint(p, 0x03); /* IPROTO_REPLACE */
++			p = mp_encode_uint(p, 0x01); /* IPROTO_SYNC */
++			p = mp_encode_uint(p, sync_id);
++
++			/* Body: Map(2) { 0x10: space 512, 0x21: tuple [call_id, node_id, state, created_at, updated_at, expires_at, val] } */
++			p = mp_encode_map(p, 2);
++			p = mp_encode_uint(p, 0x10); /* IPROTO_SPACE_ID */
++			p = mp_encode_uint(p, 512);
++			p = mp_encode_uint(p, 0x21); /* IPROTO_TUPLE */
++			p = mp_encode_array(p, 7);
++			p = mp_encode_str(p, kb, (uint32_t)kl);
++			p = mp_encode_str(p, "kam_proxy", 9);
++			p = mp_encode_str(p, "active", 6);
++			p = mp_encode_uint(p, 1700000000ULL);
++			p = mp_encode_uint(p, 1700000000ULL);
++			p = mp_encode_uint(p, 1700003600ULL);
++			p = mp_encode_str(p, val, (uint32_t)o_val);
++		}
++
++		uint32_t body_len = (uint32_t)(p - h_start);
++		dst[0] = (char)0xce;
++		uint32_t nlen = htonl(body_len);
++		memcpy(dst + 1, &nlen, 4);
++		return 5 + body_len;
++	}
++
+ 	if (is_perf) {
+ 		if (get)
+ 			return sprintf(dst, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":"
+@@ -195,6 +268,55 @@ static const char *memfind(const char *h, size_t hn, const char *nd,
+ 	return NULL;
+ }
+ 
++static int count_tnt(const char *buf, size_t n, size_t *used,
++		unsigned long long *errs)
++{
++	const char *p = buf, *e = buf + n;
++	int cnt = 0;
++	*used = 0;
++
++	while (p + 5 <= e) {
++		if ((uint8_t)*p != 0xce) {
++			(*errs)++;
++			p++;
++			continue;
++		}
++		uint32_t len;
++		memcpy(&len, p + 1, 4);
++		len = ntohl(len);
++		if (p + 5 + len > e)
++			break;
++
++		/* Check error status in IProto response header */
++		const char *hp = p + 5;
++		const char *hend = p + 5 + len;
++		if (hp < hend && ((uint8_t)*hp & 0xf0) == 0x80) {
++			const char *dec_p = hp;
++			uint32_t hmap = mp_decode_map(&dec_p);
++			for (uint32_t mi = 0; mi < hmap && dec_p < hend; mi++) {
++				uint64_t k = mp_decode_uint(&dec_p);
++				if (k == 0x00) { /* IPROTO_REQUEST_TYPE (0 = OK) */
++					uint64_t code = mp_decode_uint(&dec_p);
++					if (code != 0) (*errs)++;
++				} else if (k == 0x31) { /* IPROTO_ERROR_24 */
++					(*errs)++;
++					break;
++				} else {
++					if ((uint8_t)*dec_p <= 0x7f || (uint8_t)*dec_p >= 0xcc)
++						mp_decode_uint(&dec_p);
++					else
++						dec_p++;
++				}
++			}
++		}
++
++		cnt++;
++		p += 5 + len;
++		*used = (size_t)(p - buf);
++	}
++	return cnt;
++}
++
+ /* count complete replies in buf[0..n); *used = bytes consumed.
+  * Returns replies counted; *errs incremented per error reply. */
+ static int count_perf(const char *buf, size_t n, size_t *used,
+@@ -328,9 +450,14 @@ static void *worker(void *arg)
+ 				goto done;
+ 			}
+ 			in_len += (size_t)r;
+-			i += is_bin ? count_bin(in, in_len, &used, &t->errs)
+-			   : is_perf ? count_perf(in, in_len, &used, &t->errs)
+-			             : count_resp(in, in_len, &used, &t->errs);
++			if (is_tnt)
++				i += count_tnt(in, in_len, &used, &t->errs);
++			else if (is_bin)
++				i += count_bin(in, in_len, &used, &t->errs);
++			else if (is_perf)
++				i += count_perf(in, in_len, &used, &t->errs);
++			else
++				i += count_resp(in, in_len, &used, &t->errs);
+ 			memmove(in, in + used, in_len - used);
+ 			in_len -= used;
+ 		}
+@@ -398,11 +525,14 @@ static int fill(struct th *ts)
+ 				if (r <= 0)
+ 					return -1;
+ 				in_len += (size_t)r;
+-				i += is_bin
+-					? count_bin(in, in_len, &used, &ts[c].errs)
+-					: is_perf
+-					? count_perf(in, in_len, &used, &ts[c].errs)
+-					: count_resp(in, in_len, &used, &ts[c].errs);
++				if (is_tnt)
++					i += count_tnt(in, in_len, &used, &ts[c].errs);
++				else if (is_bin)
++					i += count_bin(in, in_len, &used, &ts[c].errs);
++				else if (is_perf)
++					i += count_perf(in, in_len, &used, &ts[c].errs);
++				else
++					i += count_resp(in, in_len, &used, &ts[c].errs);
+ 				memmove(in, in + used, in_len - used);
+ 				in_len -= used;
+ 			}
+@@ -460,6 +590,7 @@ int main(int argc, char **argv)
+ 	}
+ 	is_perf = !strcmp(o_proto, "perf");
+ 	is_bin = !strcmp(o_proto, "bin");
++	is_tnt = !strcmp(o_proto, "tnt");
+ 	if (o_conns < 1 || o_conns > 256 || o_depth < 1 || o_depth > 1024 ||
+ 	        o_keys < 1 || o_val < 1 || o_val > 60000) {
+ 		fprintf(stderr, "bad parameters\n");

@@ -1,0 +1,39 @@
+# Python / Node / IDE
+.env
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+.autopilot/
+.agents/
+CLAUDE.md
+skills-lock.json
+
+# Scratch and review HTML artifacts in root
+/*.html
+/*_files/
+/*.patch
+!benchmarks/pcbench_tarantool.patch
+
+# Large upstream source trees and submodules
+forks/
+tarantool-3.8.0/
+redis-8.10.1/
+kamailio-6.1.3/
+rtpengine-mr26.0.1.17/
+sipp-3.7.7/
+
+# Binary artifacts and object files
+*.o
+*.so
+*.a
+tests/bench_get_buf_micro
+tests/bench_scatter_gather
+
+# Runtime database snapshot and WAL files
+*.xlog
+*.snap
+*.vylog
+

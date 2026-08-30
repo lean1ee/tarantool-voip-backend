@@ -1,0 +1,38 @@
+# Dockerfile.redis
+# Upstream: https://github.com/redis/redis.git (release: 7.4.x / 8.x)
+# In-Memory key-value store baseline for performance comparison
+
+FROM debian:13-slim AS builder
+
+ARG REDIS_VERSION=8.10.1
+ARG REDIS_REPO=https://github.com/redis/redis.git
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Клонируем исходники Redis из официального репозитория
+RUN git clone --depth 1 --branch ${REDIS_VERSION} ${REDIS_REPO} /build || \
+    git clone --depth 1 ${REDIS_REPO} /build
+
+RUN make -j$(nproc) BUILD_TLS=yes
+
+FROM debian:13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3t64 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/src/redis-server /usr/local/bin/redis-server
+COPY --from=builder /build/src/redis-cli /usr/local/bin/redis-cli
+
+EXPOSE 6379
+
+CMD ["redis-server", "--protected-mode", "no", "--save", "60", "1000", "--loglevel", "notice"]

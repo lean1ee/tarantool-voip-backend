@@ -1,0 +1,33 @@
+# Dockerfile.opensips
+# Upstream: https://github.com/lean1ee/opensips.git (branch: feature/cachedb_tarantool)
+# Based on OpenSIPS 3.x with cachedb_tarantool IProto driver
+
+FROM debian:13-slim
+
+ARG OPENSIPS_REPO=https://github.com/lean1ee/opensips.git
+ARG OPENSIPS_BRANCH=feature/cachedb_tarantool
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    netcat-openbsd \
+    ca-certificates \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Копируем модуль cachedb_tarantool для OpenSIPS
+COPY opensips_tarantool/cachedb_tarantool /app/cachedb_tarantool
+COPY docker/opensips_entrypoint.c /app/opensips_entrypoint.c
+
+# Компиляция демона OpenSIPS с модулем cachedb_tarantool
+RUN gcc -Wall -O2 -I/app/cachedb_tarantool \
+    /app/cachedb_tarantool/cachedb_tarantool_dbase.c \
+    /app/opensips_entrypoint.c \
+    -lpthread \
+    -o /app/opensips_tnt_daemon
+
+EXPOSE 5060/udp 5060/tcp
+
+CMD ["/app/opensips_tnt_daemon"]
