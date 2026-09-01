@@ -21,11 +21,12 @@
  */
 
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "../../core/sr_module.h"
 #include "../../core/dprint.h"
+#include "../../core/mod_fix.h"
 #include "../../core/kemi.h"
 
 #include "tarantool_client.h"
@@ -33,146 +34,175 @@
 
 MODULE_VERSION
 
-/* Global connection pool */
-tnt_pool_t tnt_global_pool;
-
-/* Module parameters */
-static char *tnt_server = NULL;
-static char *tnt_host = TNT_DEFAULT_HOST;
-static int tnt_port = TNT_DEFAULT_PORT;
-static char *tnt_user = NULL;
-static char *tnt_pass = NULL;
-static int tnt_pool_size = TNT_DEFAULT_POOL_SIZE;
-static int tnt_connect_timeout = 1000;
-static int tnt_cmd_timeout = 500;
-static int tnt_disable_time = 10;
-static int tnt_allowed_timeouts = 3;
-static int init_without_tarantool = 0;
+/* Module configuration parameters */
+static int tnt_srv_param(modparam_t type, void *val);
+int init_without_tarantool = 0;
+int tnt_connect_timeout_param = TNT_DEFAULT_CONNECT_TIMEOUT;
+int tnt_cmd_timeout_param = TNT_DEFAULT_CMD_TIMEOUT;
+int tnt_disable_time_param = TNT_DEFAULT_DISABLE_TIME;
+int tnt_allowed_timeouts_param = TNT_DEFAULT_ALLOWED_TIMEOUTS;
 
 static int mod_init(void);
+static int child_init(int rank);
 static void mod_destroy(void);
 
-static cmd_export_t cmds[] = {{0, 0, 0, 0, 0, 0}};
+int mod_register(char *path, int *dlflags, void *p1, void *p2);
 
-static param_export_t params[] = {{"server", PARAM_STRING, &tnt_server},
-		{"host", PARAM_STRING, &tnt_host}, {"port", PARAM_INT, &tnt_port},
-		{"user", PARAM_STRING, &tnt_user}, {"pass", PARAM_STRING, &tnt_pass},
-		{"pool_size", PARAM_INT, &tnt_pool_size},
-		{"connect_timeout", PARAM_INT, &tnt_connect_timeout},
-		{"cmd_timeout", PARAM_INT, &tnt_cmd_timeout},
-		{"disable_time", PARAM_INT, &tnt_disable_time},
-		{"allowed_timeouts", PARAM_INT, &tnt_allowed_timeouts},
-		{"init_without_tarantool", PARAM_INT, &init_without_tarantool},
-		{0, 0, 0}};
+/* Script command wrappers */
+static int w_tarantool_call(
+		sip_msg_t *msg, char *proc, char *params, char *res);
+static int w_tarantool_eval(
+		sip_msg_t *msg, char *code, char *params, char *res);
 
-struct module_exports exports = {
-		"ndb_tarantool", /* module name */
-		DEFAULT_DLFLAGS, /* dlopen flags */
-		cmds,			 /* exported functions */
-		params,			 /* exported parameters */
-		0,				 /* exported RPC methods */
-		0,				 /* exported pseudo-variables */
-		0,				 /* response function */
-		mod_init,		 /* module initialization function */
-		0,				 /* per child init function */
-		mod_destroy		 /* destroy function */
+/* clang-format off */
+static cmd_export_t cmds[] = {
+	{"tarantool_call", (cmd_function)w_tarantool_call, 3,
+		fixup_spve_all, fixup_free_spve_all, ANY_ROUTE},
+	{"tarantool_eval", (cmd_function)w_tarantool_eval, 3,
+		fixup_spve_all, fixup_free_spve_all, ANY_ROUTE},
+	{0, 0, 0, 0, 0, 0}
 };
 
-/* Helper to parse server URL string (e.g. "addr=127.0.0.1;port=3301;user=rtpe;pass=sec;pool=8") */
-static void parse_server_url(const char *url)
+static param_export_t mod_params[] = {
+	{"server", PARAM_STRING | PARAM_USE_FUNC, (void *)tnt_srv_param},
+	{"init_without_tarantool", PARAM_INT, &init_without_tarantool},
+	{"connect_timeout", PARAM_INT, &tnt_connect_timeout_param},
+	{"cmd_timeout", PARAM_INT, &tnt_cmd_timeout_param},
+	{"disable_time", PARAM_INT, &tnt_disable_time_param},
+	{"allowed_timeouts", PARAM_INT, &tnt_allowed_timeouts_param},
+	{0, 0, 0}
+};
+
+struct module_exports exports = {
+	"ndb_tarantool",        /* module name */
+	DEFAULT_DLFLAGS,        /* dlopen flags */
+	cmds,                   /* exported functions */
+	mod_params,             /* exported parameters */
+	0,                      /* exported RPC methods */
+	0,                      /* exported pseudo-variables */
+	0,                      /* response function */
+	mod_init,               /* module initialization function */
+	child_init,             /* per child init function */
+	mod_destroy             /* destroy function */
+};
+/* clang-format on */
+
+/**
+ * tnt_srv_param - Handler for 'server' modparam
+ * @type: parameter type
+ * @val: parameter value string
+ */
+static int tnt_srv_param(modparam_t type, void *val)
 {
-	if(!url)
-		return;
-	char *copy = strdup(url);
-	if(!copy)
-		return;
-
-	char *token = strtok(copy, ";");
-	while(token) {
-		char *eq = strchr(token, '=');
-		if(eq) {
-			*eq = '\0';
-			char *key = token;
-			char *val = eq + 1;
-			if(strcmp(key, "addr") == 0 || strcmp(key, "host") == 0) {
-				tnt_host = strdup(val);
-			} else if(strcmp(key, "port") == 0) {
-				tnt_port = atoi(val);
-			} else if(strcmp(key, "user") == 0) {
-				tnt_user = strdup(val);
-			} else if(strcmp(key, "pass") == 0) {
-				tnt_pass = strdup(val);
-			} else if(strcmp(key, "pool") == 0) {
-				tnt_pool_size = atoi(val);
-			}
-		}
-		token = strtok(NULL, ";");
-	}
-	free(copy);
-}
-
-static int mod_init(void)
-{
-	if(tnt_server) {
-		parse_server_url(tnt_server);
-	}
-
-	LM_INFO("Initializing ndb_tarantool connecting to %s:%d (pool=%d, "
-			"timeout=%dms)...\n",
-			tnt_host, tnt_port, tnt_pool_size, tnt_connect_timeout);
-
-	int rc = tnt_pool_init(&tnt_global_pool, tnt_host, tnt_port, tnt_user,
-			tnt_pass, tnt_pool_size, tnt_connect_timeout);
-	if(rc != 0) {
-		if(init_without_tarantool) {
-			LM_WARN("Failed to connect to Tarantool at bootstrap, but "
-					"init_without_tarantool is enabled. Continuing...\n");
-			return 0;
-		}
-		LM_ERR("Failed to initialize Tarantool connection pool\n");
+	if(type != PARAM_STRING || !val) {
+		LM_ERR("invalid server parameter specification\n");
 		return -1;
 	}
+	return tnt_add_server((char *)val);
+}
 
-	LM_INFO("ndb_tarantool module initialized successfully.\n");
+/**
+ * mod_init - Module initialization
+ */
+static int mod_init(void)
+{
+	LM_INFO("initializing ndb_tarantool module...\n");
 	return 0;
 }
 
+/**
+ * child_init - Per-child worker process initialization
+ * @rank: process rank ID
+ */
+static int child_init(int rank)
+{
+	/* Skip management processes without SIP routing duties */
+	if(rank == PROC_INIT || rank == PROC_MAIN || rank == PROC_TCP_MAIN) {
+		return 0;
+	}
+
+	LM_DBG("initializing tarantool connections for child process rank=%d\n",
+			rank);
+	if(tnt_child_init(rank) < 0) {
+		LM_ERR("failed to initialize tarantool connections for child rank %d\n",
+				rank);
+		return -1;
+	}
+	return 0;
+}
+
+/**
+ * mod_destroy - Module destroy cleanup
+ */
 static void mod_destroy(void)
 {
-	LM_INFO("Destroying ndb_tarantool module...\n");
-	tnt_pool_destroy(&tnt_global_pool);
+	LM_INFO("destroying ndb_tarantool module resources...\n");
+	tnt_destroy_all();
 }
 
-/* KEMI Bindings */
-static int ki_tarantool_call(sip_msg_t *msg, str *proc, str *params, str *res)
+/**
+ * w_tarantool_call - Script function: tarantool_call(proc, params, res)
+ */
+static int w_tarantool_call(sip_msg_t *msg, char *proc, char *params, char *res)
 {
-	return sr_kemi_tarantool_call(
-			msg, (str_t *)proc, (str_t *)params, (str_t *)res);
+	str s_proc = {NULL, 0};
+	str s_params = {NULL, 0};
+	str s_res = {NULL, 0};
+	int rc;
+	(void)res;
+
+	if(!proc || fixup_get_svalue(msg, (gparam_t *)proc, &s_proc) != 0) {
+		LM_ERR("failed to get procedure name\n");
+		return -1;
+	}
+	if(params && fixup_get_svalue(msg, (gparam_t *)params, &s_params) != 0) {
+		LM_ERR("failed to get procedure params\n");
+		return -1;
+	}
+
+	rc = sr_kemi_tarantool_call(msg, &s_proc, &s_params, &s_res);
+	if(s_res.s) {
+		pkg_free(s_res.s);
+	}
+	return rc;
 }
 
-static int ki_tarantool_eval(sip_msg_t *msg, str *code, str *params, str *res)
+/**
+ * w_tarantool_eval - Script function: tarantool_eval(code, params, res)
+ */
+static int w_tarantool_eval(sip_msg_t *msg, char *code, char *params, char *res)
 {
-	return sr_kemi_tarantool_eval(
-			msg, (str_t *)code, (str_t *)params, (str_t *)res);
+	str s_code = {NULL, 0};
+	str s_params = {NULL, 0};
+	str s_res = {NULL, 0};
+	int rc;
+	(void)res;
+
+	if(!code || fixup_get_svalue(msg, (gparam_t *)code, &s_code) != 0) {
+		LM_ERR("failed to get lua code expression\n");
+		return -1;
+	}
+	if(params && fixup_get_svalue(msg, (gparam_t *)params, &s_params) != 0) {
+		LM_ERR("failed to get eval params\n");
+		return -1;
+	}
+
+	rc = sr_kemi_tarantool_eval(msg, &s_code, &s_params, &s_res);
+	if(s_res.s) {
+		pkg_free(s_res.s);
+	}
+	return rc;
 }
 
-static sr_kemi_t sr_kemi_ndb_tarantool_exports[] = {
-		{str_init("tarantool"), str_init("call"), SR_KEMIP_INT,
-				(void *)ki_tarantool_call,
-				{SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_NONE,
-						SR_KEMIP_NONE, SR_KEMIP_NONE}},
-		{str_init("tarantool"), str_init("eval"), SR_KEMIP_INT,
-				(void *)ki_tarantool_eval,
-				{SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_STR, SR_KEMIP_NONE,
-						SR_KEMIP_NONE, SR_KEMIP_NONE}},
-		{{0, 0}, {0, 0}, 0, NULL, {0, 0, 0, 0, 0, 0}}};
-
+/**
+ * mod_register - Dynamic registration of KEMI exports
+ */
 int mod_register(char *path, int *dlflags, void *p1, void *p2)
 {
 	(void)path;
 	(void)dlflags;
 	(void)p1;
 	(void)p2;
-	sr_kemi_modules_add(sr_kemi_ndb_tarantool_exports);
+	sr_kemi_ndb_tarantool_register();
 	return 0;
 }

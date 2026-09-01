@@ -6,14 +6,67 @@
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "dprint.h"
+#include "basex.h"
 #include "tarantool_client.h"
 #include "tarantool_kemi.h"
+
+/* Kamailio Core Logging and Runtime Stubs for Standalone Container Test Daemon */
+int log_stderr = 1;
+int log_color = 0;
+str *log_prefix_val = NULL;
+int process_no = 0;
+volatile int dprint_crit = 0;
+char *log_name = "kamailio";
+char *log_fqdn = "localhost";
+
+int my_pid(void) { return 1; }
+
+struct log_level_info log_level_info[] = {
+	{"ALERT", 1},
+	{"CRIT", 2},
+	{"ERR", 3},
+	{"WARN", 4},
+	{"NOTICE", 5},
+	{"INFO", 6},
+	{"DBG", 7},
+	{NULL, 0}
+};
+
+void dprint_color(int color) { (void)color; }
+void dprint_color_reset(void) {}
+int get_debug_facility(char *mname, int mnlen) { (void)mname; (void)mnlen; return 0; }
+int get_debug_level(char *mname, int mnlen) { (void)mname; (void)mnlen; return 3; }
+ksr_slog_f _ksr_slog_func = NULL;
+km_log_f _km_log_func = NULL;
+int sr_kemi_modules_add(sr_kemi_t *klist) { (void)klist; return 0; }
+
+/* Module parameter variables */
+int tnt_connect_timeout_param = 1000;
+int tnt_cmd_timeout_param = 1000;
+int tnt_disable_time_param = 60;
+int tnt_allowed_timeouts_param = 3;
+int init_without_tarantool = 0;
+
+/* Shared memory stub using standard heap allocator for standalone test daemon */
+static void *stub_shm_malloc(void *q, size_t size, ...) { (void)q; return malloc(size); }
+static void *stub_shm_mallocxz(void *q, size_t size, ...) { (void)q; return calloc(1, size); }
+static void stub_shm_free(void *q, void *p, ...) { (void)q; free(p); }
+static void *stub_shm_realloc(void *q, void *p, size_t size, ...) { (void)q; return realloc(p, size); }
+
+sr_shm_api_t _shm_root = {
+	.xmalloc = (void *)stub_shm_malloc,
+	.xmallocxz = (void *)stub_shm_mallocxz,
+	.xfree = (void *)stub_shm_free,
+	.xrealloc = (void *)stub_shm_realloc,
+};
 
 #define SIP_PORT 5060
 #define UAS_IP "172.28.0.40"
@@ -111,8 +164,6 @@ static void delete_session(const char *call_id) {
   }
 }
 
-extern tnt_pool_t tnt_global_pool;
-
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -129,8 +180,13 @@ int main(int argc, char **argv) {
   printf("[Kamailio] Tarantool: %s:%d, RTPEngine: %s:%d, UAS Target: %s:%d\n",
          tnt_host, tnt_port, rtpe_host, rtpe_port, UAS_IP, UAS_PORT);
 
-  tnt_pool_init(&tnt_global_pool, tnt_host, tnt_port, "rtpe_user",
-                "rtpe_secret_password", 8, 500);
+  init_basex();
+  char srv_spec[512];
+  snprintf(srv_spec, sizeof(srv_spec),
+           "name=default;addr=%s;port=%d;user=rtpe_user;pass=rtpe_secret_password",
+           tnt_host, tnt_port);
+  tnt_add_server(srv_spec);
+  tnt_child_init(1);
 
   int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
   if (sockfd < 0) {
@@ -187,12 +243,12 @@ int main(int argc, char **argv) {
       store_session(call_id, &cliaddr, len);
 
       // KEMI stored procedure call to Tarantool
-      str_t proc = {.s = "rtpe_select_node", .len = 16};
-      str_t params = {.s = "[]", .len = 2};
-      str_t res = {.s = NULL, .len = 0};
+      str proc = {.s = "rtpe_select_node", .len = 16};
+      str params = {.s = "[]", .len = 2};
+      str res = {.s = NULL, .len = 0};
       sr_kemi_tarantool_call(NULL, &proc, &params, &res);
       if (res.s)
-        free(res.s);
+        pkg_free(res.s);
 
       // Send offer command to RTPEngine
       char rtpe_req[1024];
@@ -250,6 +306,7 @@ int main(int argc, char **argv) {
   }
 
   close(sockfd);
-  tnt_pool_destroy(&tnt_global_pool);
+  tnt_child_destroy();
+  tnt_destroy_all();
   return 0;
 }

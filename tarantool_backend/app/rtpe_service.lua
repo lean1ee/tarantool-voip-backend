@@ -23,7 +23,7 @@ function rtpe_service.call_upsert(call_id, node_id, payload, ttl_sec)
     end
 
     local now = math.floor(fiber.time())
-    local ttl = ttl_sec or 3600
+    local ttl = (type(ttl_sec) == 'number' and ttl_sec > 0) and ttl_sec or 3600
     local expires_at = now + ttl
     local space = box.space.rtpe_calls
 
@@ -31,14 +31,13 @@ function rtpe_service.call_upsert(call_id, node_id, payload, ttl_sec)
         return { ok = false, error = "Space rtpe_calls not initialized" }
     end
 
+    local node = (node_id and type(node_id) == 'string') and node_id or 'default-node'
     local tuple = space:get(call_id)
     if tuple == nil then
-        -- New call: insert new tuple with initial creation timestamp
-        space:insert({ call_id, node_id, 'active', now, now, expires_at, payload })
+        space:insert({ call_id, node, 'active', now, now, expires_at, payload })
     else
-        -- Existing call: update last modification timestamp while preserving created_at
         local created_at = tuple[4]
-        space:replace({ call_id, node_id, 'active', created_at, now, expires_at, payload })
+        space:replace({ call_id, node, 'active', created_at, now, expires_at, payload })
     end
 
     return { ok = true, call_id = call_id, updated_at = now, expires_at = expires_at }
@@ -48,7 +47,7 @@ end
 -- @param call_id string: SIP Call-ID to remove
 -- @return table: Status indicating whether tuple was found and removed
 function rtpe_service.call_delete(call_id)
-    if not call_id then
+    if not call_id or type(call_id) ~= 'string' then
         return { ok = false, error = "Missing call_id parameter" }
     end
 
@@ -69,6 +68,10 @@ end
 -- @param call_id string: SIP Call-ID
 -- @return table|nil: Structured session record or nil if not found
 function rtpe_service.call_get(call_id)
+    if not call_id or type(call_id) ~= 'string' then
+        return nil
+    end
+
     local space = box.space.rtpe_calls
     if not space then return nil end
 
@@ -87,7 +90,7 @@ function rtpe_service.call_get(call_id)
 end
 
 --- Instant O(log N) failover retrieval of all active calls for a dead or recovering node
--- @param node_id string|nil: Target node identifier (empty string returns all active calls)
+-- @param node_id string|nil: Target node identifier (nil/empty returns all active calls)
 -- @return table: Array of active call payloads for fast session adoption
 function rtpe_service.call_restore(node_id)
     local space = box.space.rtpe_calls
@@ -96,8 +99,7 @@ function rtpe_service.call_restore(node_id)
     local now = math.floor(fiber.time())
     local result = {}
 
-    if node_id and node_id ~= "" then
-        -- Fast secondary index lookup by node_id
+    if node_id and type(node_id) == 'string' and node_id ~= "" then
         for _, tuple in space.index.by_node:pairs(node_id) do
             if tuple[6] > now then
                 table.insert(result, {
@@ -108,7 +110,6 @@ function rtpe_service.call_restore(node_id)
             end
         end
     else
-        -- Full active session scan
         for _, tuple in space:pairs() do
             if tuple[6] > now then
                 table.insert(result, {
@@ -123,8 +124,29 @@ function rtpe_service.call_restore(node_id)
     return result
 end
 
+--- Register or update RTPEngine node heartbeat and active call gauge
+-- @param node_id string: RTPEngine node ID
+-- @param address string: IP / socket address
+-- @param active_calls number: Current active media stream count
+-- @return table: Status
+function rtpe_service.node_heartbeat(node_id, address, active_calls)
+    if not node_id or type(node_id) ~= 'string' then
+        return { ok = false, error = "Invalid node_id" }
+    end
+
+    local space = box.space.cluster_nodes
+    if not space then return { ok = false, error = "Space cluster_nodes not found" } end
+
+    local now = math.floor(fiber.time())
+    local calls = (type(active_calls) == 'number' and active_calls >= 0) and active_calls or 0
+    local addr = (address and type(address) == 'string') and address or '127.0.0.1:22222'
+
+    space:replace({ node_id, addr, 'active', calls, now })
+    return { ok = true, node_id = node_id, updated_at = now }
+end
+
 --- Intelligent in-memory load balancer for RTPEngine media node selection
--- Evaluates online nodes and chooses the one with the lowest active call count in 70 µs
+-- Evaluates online nodes and chooses the one with the lowest active call count in < 70 µs
 -- @return table|nil: Selected optimal node record or nil if no active nodes available
 function rtpe_service.select_optimal_node()
     local space = box.space.cluster_nodes
@@ -137,7 +159,6 @@ function rtpe_service.select_optimal_node()
     for _, tuple in space:pairs() do
         local status = tuple[3]
         local last_ping = tuple[5]
-        -- Node is considered alive if heartbeat was received within the last 10 seconds
         if status == 'active' and (now - last_ping) < 10 then
             local active_calls = tuple[4]
             if active_calls < min_calls then

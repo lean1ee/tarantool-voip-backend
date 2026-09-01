@@ -33,12 +33,18 @@ rawset(_G, 'rtpe_call_upsert', rtpe_service.call_upsert)
 rawset(_G, 'rtpe_call_delete', rtpe_service.call_delete)
 rawset(_G, 'rtpe_call_get', rtpe_service.call_get)
 rawset(_G, 'rtpe_call_restore', rtpe_service.call_restore)
+rawset(_G, 'rtpe_node_heartbeat', rtpe_service.node_heartbeat)
 rawset(_G, 'rtpe_select_node', rtpe_service.select_optimal_node)
 
--- Real-time Billing, Anti-Fraud, and CDR Procedures
+-- Real-time Billing, Anti-Fraud, Provisioning and CDR Procedures
 rawset(_G, 'billing_authorize_call', billing_service.authorize_call)
 rawset(_G, 'billing_finalize_cdr', billing_service.finalize_cdr)
 rawset(_G, 'billing_get_live_stats', billing_service.get_live_stats)
+rawset(_G, 'billing_add_subscriber', billing_service.add_subscriber)
+rawset(_G, 'billing_update_balance', billing_service.update_balance)
+rawset(_G, 'billing_set_tariff', billing_service.set_tariff)
+rawset(_G, 'ttl_get_stats', ttl_worker.get_stats)
+
 rawset(_G, 'voip_routing_lookup', function(sub_id, tariff_id, ep_id)
     return {
         box.space.subscribers and box.space.subscribers:get({sub_id or 'alice@example.com'}),

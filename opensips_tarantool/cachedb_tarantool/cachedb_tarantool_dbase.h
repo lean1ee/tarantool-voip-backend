@@ -1,6 +1,10 @@
 /*
- * OpenSIPS cachedb_tarantool module
+ * Copyright (C) 2026 OpenSIPS Solutions
+ *
+ * modules/cachedb_tarantool/cachedb_tarantool_dbase.h
  * High-performance Tarantool 3.x CacheDB driver and IProto client
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #ifndef CACHEDB_TARANTOOL_DBASE_H
@@ -18,6 +22,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__GNUC__) || defined(__clang__)
+#define TNT_MUST_CHECK __attribute__((warn_unused_result))
+#else
+#define TNT_MUST_CHECK
+#endif
+
 #if __has_include("../../str.h") && __has_include("../../cachedb/cachedb.h")
 #define TNT_REAL_OPENSIPS 1
 #include "../../str.h"
@@ -27,32 +37,62 @@
 #include "../../dprint.h"
 #include "../../mem/mem.h"
 #else
-#ifndef STR_H
+#ifndef STR_H_DEFINED
+#define STR_H_DEFINED
 typedef struct str_t {
-    char *s;
-    int len;
+	char *s;
+	int len;
 } str;
-#define str_init(str_val) { (str_val), sizeof(str_val) - 1 }
+#define str_init(str_val) { (str_val), (int)sizeof(str_val) - 1 }
 #endif
 
-#ifndef CACHEDB_H
+#ifndef CACHEDB_H_DEFINED
+#define CACHEDB_H_DEFINED
 typedef void cachedb_con;
 typedef enum { CDB_STR, CDB_INT } cdb_val_type_t;
-/* mirror the real core's cdb_raw_entry: val is a union holding a str,
- * so val.s.s compiles identically in both builds */
+
 typedef struct cdb_raw_entry {
-    union {
-        str s;
-        int n;
-    } val;
-    cdb_val_type_t type;
+	union {
+		str s;
+		int n;
+	} val;
+	cdb_val_type_t type;
 } cdb_raw_entry;
+
+typedef struct cachedb_url {
+	str url;
+	struct cachedb_url *next;
+} cachedb_url;
+
+typedef struct cachedb_funcs {
+	cachedb_con *(*init)(const str *);
+	void (*destroy)(cachedb_con *);
+	int (*get)(cachedb_con *, const str *, str *);
+	int (*set)(cachedb_con *, const str *, const str *, int);
+	int (*remove)(cachedb_con *, const str *);
+	int (*raw_query)(cachedb_con *, const str *, cdb_raw_entry ***, int, int *);
+	int (*get_buf)(cachedb_con *, const str *, char *, unsigned int, unsigned int *, unsigned int *);
+	int capability;
+} cachedb_funcs_t;
+
+typedef struct cachedb_engine {
+	str name;
+	cachedb_funcs_t cdb_func;
+} cachedb_engine;
+
+#define register_cachedb(engine) (0)
+#define cachedb_store_url(head, url) (0)
+#define cachedb_put_connection(name, con) (0)
+#define cachedb_get_connection(name, cluster) (NULL)
+#define cachedb_free_url(urls) ((void)0)
+#define cachedb_end_connections(name) ((void)0)
 #endif
 
 #ifndef LM_ERR
-#define LM_ERR(fmt, ...) printf("[OpenSIPS ERR] " fmt, ##__VA_ARGS__)
-#define LM_WARN(fmt, ...) printf("[OpenSIPS WARN] " fmt, ##__VA_ARGS__)
-#define LM_INFO(fmt, ...) printf("[OpenSIPS INFO] " fmt, ##__VA_ARGS__)
+#define LM_ERR(...) do { printf("[OpenSIPS ERR] " __VA_ARGS__); } while (0)
+#define LM_WARN(...) do { printf("[OpenSIPS WARN] " __VA_ARGS__); } while (0)
+#define LM_INFO(...) do { printf("[OpenSIPS INFO] " __VA_ARGS__); } while (0)
+#define LM_NOTICE(...) do { printf("[OpenSIPS NOTICE] " __VA_ARGS__); } while (0)
 #endif
 
 #ifndef pkg_malloc
@@ -61,15 +101,15 @@ typedef struct cdb_raw_entry {
 #define pkg_strdup strdup
 #endif
 
-/* layout stand-in for the real cachedb_pool_con (id, ref, next) */
 typedef struct cachedb_pool_con_t {
-    void *id;
-    unsigned int ref;
-    struct cachedb_pool_con_t *next;
+	void *id;
+	unsigned int ref;
+	struct cachedb_pool_con_t *next;
 } cachedb_pool_con;
 
-#endif
+#endif /* TNT_REAL_OPENSIPS */
 
+/* IProto Protocol Constants */
 #define IPROTO_REQUEST_TYPE   0x00
 #define IPROTO_SYNC           0x01
 #define IPROTO_SPACE_ID       0x10
@@ -104,50 +144,60 @@ typedef struct cachedb_pool_con_t {
 #define DEFAULT_ALLOWED_ERRORS     3
 #define DEFAULT_POOL_SIZE          8
 
+#define TNT_GREETING_SIZE          128
+#define TNT_SHA1_DIGEST_SIZE       20
+
+/**
+ * enum tnt_conn_state - Socket connection state
+ */
 typedef enum {
-    TNT_STATE_DISCONNECTED = 0,
-    TNT_STATE_CONNECTING,
-    TNT_STATE_CONNECTED,
-    TNT_STATE_AUTHENTICATED,
-    TNT_STATE_ERROR,
-    TNT_STATE_DISABLED
+	TNT_STATE_DISCONNECTED = 0,
+	TNT_STATE_CONNECTING,
+	TNT_STATE_CONNECTED,
+	TNT_STATE_AUTHENTICATED,
+	TNT_STATE_ERROR,
+	TNT_STATE_DISABLED
 } tnt_conn_state_t;
 
+/**
+ * struct tnt_single_conn - Individual socket connection to Tarantool
+ */
 typedef struct tnt_single_conn {
-    int sock_fd;
-    tnt_conn_state_t state;
-    uint64_t sync_counter;
-    time_t last_activity;
-    time_t disabled_until;
-    int consecutive_errors;
+	int sock_fd;
+	tnt_conn_state_t state;
+	uint64_t sync_counter;
+	time_t last_activity;
+	time_t disabled_until;
+	int consecutive_errors;
 } tnt_single_conn_t;
 
+/**
+ * struct tnt_cluster_con - Cluster connection pool handle
+ */
 typedef struct tnt_cluster_con {
-    /* MUST be the first member: the core's connection pool treats this
-     * struct as a cachedb_pool_con (id, ref, next) */
-    cachedb_pool_con cache_con;
+	cachedb_pool_con cache_con;
 
-    str name;
-    str host;
-    int port;
-    str user;
-    str pass;
-    str space;
-    uint32_t space_id;
-    
-    int pool_size;
-    int current_idx;
-    tnt_single_conn_t *conns;
-    pthread_mutex_t lock;
-    pid_t owner_pid;
-    
-    int connect_timeout_ms;
-    int query_timeout_ms;
-    int disable_time_sec;
-    int allowed_errors;
-    int lazy_connect;
-    int init_without_tarantool;
-    int tcp_keepalive;
+	str name;
+	str host;
+	int port;
+	str user;
+	str pass;
+	str space;
+	uint32_t space_id;
+
+	int pool_size;
+	int current_idx;
+	tnt_single_conn_t *conns;
+	pthread_mutex_t lock;
+	pid_t owner_pid;
+
+	int connect_timeout_ms;
+	int query_timeout_ms;
+	int disable_time_sec;
+	int allowed_errors;
+	int lazy_connect;
+	int init_without_tarantool;
+	int tcp_keepalive;
 } tnt_cluster_con_t;
 
 /* Global module configuration parameters */
@@ -160,17 +210,17 @@ extern int tarantool_init_without_tnt;
 extern int tarantool_pool_size;
 extern int tarantool_tcp_keepalive;
 
-/* OpenSIPS CacheDB function prototypes */
-cachedb_con *tarantool_init(str *url);
+/* OpenSIPS CacheDB Interface Functions */
+cachedb_con *tarantool_init(const str *url);
 void tarantool_destroy(cachedb_con *con);
-int tarantool_get(cachedb_con *con, str *attr, str *val);
-int tarantool_get_buf(cachedb_con *con, str *attr, char *buf, unsigned int buflen, unsigned int *vlen, unsigned int *needed);
-int tarantool_set(cachedb_con *con, str *attr, str *val, int expires);
-int tarantool_remove(cachedb_con *con, str *attr);
-int tarantool_raw_query(cachedb_con *con, str *query, cdb_raw_entry ***reply, int num_cols, int *num_rows);
+int tarantool_get(cachedb_con *con, const str *attr, str *val) TNT_MUST_CHECK;
+int tarantool_get_buf(cachedb_con *con, const str *attr, char *buf, unsigned int buflen, unsigned int *vlen, unsigned int *needed) TNT_MUST_CHECK;
+int tarantool_set(cachedb_con *con, const str *attr, const str *val, int expires) TNT_MUST_CHECK;
+int tarantool_remove(cachedb_con *con, const str *attr) TNT_MUST_CHECK;
+int tarantool_raw_query(cachedb_con *con, const str *query, cdb_raw_entry ***reply, int num_cols, int *num_rows) TNT_MUST_CHECK;
 
 /* Stored procedure and eval execution */
-int tarantool_call_proc(tnt_cluster_con_t *tcon, const str *proc, const str *args, str *res);
-int tarantool_eval_expr(tnt_cluster_con_t *tcon, const str *expr, const str *args, str *res);
+int tarantool_call_proc(tnt_cluster_con_t *tcon, const str *proc, const str *args, str *res) TNT_MUST_CHECK;
+int tarantool_eval_expr(tnt_cluster_con_t *tcon, const str *expr, const str *args, str *res) TNT_MUST_CHECK;
 
 #endif /* CACHEDB_TARANTOOL_DBASE_H */

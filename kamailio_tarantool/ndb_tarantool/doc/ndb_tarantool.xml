@@ -11,16 +11,22 @@
 <book xmlns:xi="http://www.w3.org/2001/XInclude">
 	<bookinfo>
 		<title>NDB_TARANTOOL Module</title>
-		<productname class="trade">&kamailio;</productname>
+		<productname class="trade">sip-router.org</productname>
 		<authorgroup>
 			<author>
-				<firstname>lean1ee</firstname>
-				<email>lean1ee@users.noreply.github.com</email>
+				<firstname>Andrei</firstname>
+				<surname>Lashchinskii</surname>
+				<email>koorwork+kamailio@gmail.com</email>
 			</author>
+			<editor>
+				<firstname>Andrei</firstname>
+				<surname>Lashchinskii</surname>
+				<email>koorwork+kamailio@gmail.com</email>
+			</editor>
 		</authorgroup>
 		<copyright>
 			<year>2026</year>
-			<holder>lean1ee</holder>
+			<holder>Andrei Lashchinskii</holder>
 		</copyright>
 	</bookinfo>
 	<toc></toc>

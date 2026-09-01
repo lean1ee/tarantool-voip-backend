@@ -3,10 +3,13 @@
     Carrier-grade Tarantool 3.x schema definition for Kamailio, OpenSIPS & RTPEngine.
 
     Spaces defined:
-      - rtpe_calls:    Active RTPEngine media sessions and call legs
-      - kam_dialogs:   Active SIP dialogs for Kamailio / OpenSIPS
-      - kam_usrloc:    User location registrations
-      - cluster_nodes: Heartbeat and load-balancing state for media relays
+      - rtpe_calls:    Active RTPEngine media sessions and call legs (ID: 512)
+      - cluster_nodes: Heartbeat and load-balancing state for media relays (ID: 513)
+      - kam_dialogs:   Active SIP dialogs for Kamailio / OpenSIPS (ID: 514)
+      - kam_usrloc:    User location registrations (ID: 515)
+      - subscribers:   Prepaid/postpaid balances, currencies, limits (ID: 516)
+      - tariffs:       Rate table for destination prefixes & connect fees (ID: 517)
+      - cdrs:          Real-time CDRs with duration, billing, and MOS (ID: 518)
 
     SPDX-License-Identifier: GPL-2.0-or-later
 ]]
@@ -26,6 +29,7 @@ function schema.init()
     local calls = box.schema.space.create('rtpe_calls', {
         id = 512,
         if_not_exists = true,
+        engine = 'memtx',
         format = {
             { name = 'call_id',    type = 'string' },   -- SIP Call-ID (Primary Key)
             { name = 'node_id',    type = 'string' },   -- RTPEngine instance identifier
@@ -37,22 +41,17 @@ function schema.init()
         }
     })
 
-    -- Primary Index: call_id (O(log N) lookup by Call-ID)
     calls:create_index('primary', {
         parts = { 'call_id' },
         if_not_exists = true,
     })
 
-    -- Secondary Index: node_id + updated_at
-    -- Enables instant O(log N) failover retrieval of all sessions belonging to a failed media relay
     calls:create_index('by_node', {
         parts = { 'node_id', 'updated_at' },
         if_not_exists = true,
         unique = false,
     })
 
-    -- Secondary Index: expires_at
-    -- Enables ordered, non-blocking range scan for continuous TTL cleanup fiber
     calls:create_index('by_expire', {
         parts = { 'expires_at' },
         if_not_exists = true,
@@ -60,12 +59,41 @@ function schema.init()
     })
 
     ----------------------------------------------------------------------------
-    -- 2. Space: kam_dialogs (Space ID: 514)
+    -- 2. Space: cluster_nodes (Space ID: 513)
+    -- Tracks health, active call count, and availability of RTPEngine media nodes
+    ----------------------------------------------------------------------------
+    local nodes = box.schema.space.create('cluster_nodes', {
+        id = 513,
+        if_not_exists = true,
+        engine = 'memtx',
+        format = {
+            { name = 'node_id',      type = 'string' },
+            { name = 'address',      type = 'string' },
+            { name = 'status',       type = 'string' },
+            { name = 'active_calls', type = 'unsigned' },
+            { name = 'last_ping',    type = 'unsigned' },
+        }
+    })
+
+    nodes:create_index('primary', {
+        parts = { 'node_id' },
+        if_not_exists = true,
+    })
+
+    nodes:create_index('by_status_calls', {
+        parts = { 'status', 'active_calls' },
+        if_not_exists = true,
+        unique = false,
+    })
+
+    ----------------------------------------------------------------------------
+    -- 3. Space: kam_dialogs (Space ID: 514)
     -- Stores active SIP dialogs synchronized across Kamailio and OpenSIPS proxies
     ----------------------------------------------------------------------------
     local dialogs = box.schema.space.create('kam_dialogs', {
         id = 514,
         if_not_exists = true,
+        engine = 'memtx',
         format = {
             { name = 'call_id',    type = 'string' },
             { name = 'from_tag',   type = 'string' },
@@ -87,13 +115,20 @@ function schema.init()
         unique = false,
     })
 
+    dialogs:create_index('by_caller', {
+        parts = { 'from_tag', 'expires_at' },
+        if_not_exists = true,
+        unique = false,
+    })
+
     ----------------------------------------------------------------------------
-    -- 3. Space: kam_usrloc (Space ID: 515)
+    -- 4. Space: kam_usrloc (Space ID: 515)
     -- Stores SIP subscriber registrations (UsrLoc location table)
     ----------------------------------------------------------------------------
     local usrloc = box.schema.space.create('kam_usrloc', {
         id = 515,
         if_not_exists = true,
+        engine = 'memtx',
         format = {
             { name = 'contact_key', type = 'string' },
             { name = 'username',    type = 'string' },
@@ -124,28 +159,13 @@ function schema.init()
     })
 
     ----------------------------------------------------------------------------
-    -- 4. Space: cluster_nodes (Space ID: 513)
-    -- Tracks health, active call count, and availability of RTPEngine media nodes
-    ----------------------------------------------------------------------------
-    local nodes = box.schema.space.create('cluster_nodes', {
-        id = 513,
-        if_not_exists = true,
-        format = {
-            { name = 'node_id',     type = 'string' },
-            { name = 'address',     type = 'string' },
-            { name = 'status',      type = 'string' },
-            { name = 'active_calls',type = 'unsigned' },
-            { name = 'last_ping',   type = 'unsigned' },
-        }
-    })
-
-    ----------------------------------------------------------------------------
     -- 5. Space: subscribers (Space ID: 516)
     -- Prepaid / postpaid subscriber profiles, real-time balances, and limits
     ----------------------------------------------------------------------------
     local subs = box.schema.space.create('subscribers', {
         id = 516,
         if_not_exists = true,
+        engine = 'memtx',
         format = {
             { name = 'subscriber_id',       type = 'string' },   -- E.164 phone or SIP username (PK)
             { name = 'balance',             type = 'number' },   -- Real-time monetary balance
@@ -169,6 +189,7 @@ function schema.init()
     local tariffs = box.schema.space.create('tariffs', {
         id = 517,
         if_not_exists = true,
+        engine = 'memtx',
         format = {
             { name = 'prefix',          type = 'string' }, -- Destination prefix ('1', '7', '44', 'default')
             { name = 'description',     type = 'string' }, -- Destination name ('USA/Canada', 'Russia Mobile')
@@ -189,6 +210,7 @@ function schema.init()
     local cdrs = box.schema.space.create('cdrs', {
         id = 518,
         if_not_exists = true,
+        engine = 'memtx',
         format = {
             { name = 'cdr_id',          type = 'string' },   -- Unique CDR identifier (PK)
             { name = 'call_id',         type = 'string' },   -- SIP Call-ID

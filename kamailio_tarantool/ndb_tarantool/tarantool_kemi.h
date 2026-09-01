@@ -17,30 +17,26 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  */
 
-#ifndef _TARANTOOL_KEMI_H_
-#define _TARANTOOL_KEMI_H_
+#ifndef NDB_TARANTOOL_KEMI_H
+#define NDB_TARANTOOL_KEMI_H
 
-#ifdef __cplusplus
-extern "C"
-{
-#endif
+#include "../../core/kemi.h"
+#include "../../core/sr_module.h"
+#include "../../core/str.h"
 
-	typedef struct str_s
-	{
-		char *s;
-		int len;
-	} str_t;
+int sr_kemi_tarantool_call(sip_msg_t *msg, str *proc_name, str *params_json,
+                           str *res_dst);
+int sr_kemi_tarantool_eval(sip_msg_t *msg, str *lua_code, str *params_json,
+                           str *res_dst);
 
-	int sr_kemi_tarantool_call(
-			void *msg, str_t *proc_name, str_t *params_json, str_t *res_dst);
-	int sr_kemi_tarantool_eval(
-			void *msg, str_t *lua_code, str_t *params_json, str_t *res_dst);
+int sr_kemi_tarantool_call_srv(sip_msg_t *msg, str *srv_name, str *proc_name,
+                               str *params_json, str *res_dst);
+int sr_kemi_tarantool_eval_srv(sip_msg_t *msg, str *srv_name, str *lua_code,
+                               str *params_json, str *res_dst);
 
-#ifdef __cplusplus
-}
-#endif
+int sr_kemi_ndb_tarantool_register(void);
 
-#endif /* _TARANTOOL_KEMI_H_ */
+#endif /* NDB_TARANTOOL_KEMI_H */

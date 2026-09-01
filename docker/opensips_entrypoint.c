@@ -168,8 +168,8 @@ int main(int argc, char **argv) {
                 str proc = { .s = "rtpe_select_node", .len = 16 };
                 str args = { .s = "[]", .len = 2 };
                 str res = { .s = NULL, .len = 0 };
-                tarantool_call_proc((tnt_cluster_con_t *)con, &proc, &args, &res);
-                if (res.s) free(res.s);
+                int rc = tarantool_call_proc((tnt_cluster_con_t *)con, &proc, &args, &res);
+                if (rc == 0 && res.s) free(res.s);
             }
 
             char rtpe_req[1024];

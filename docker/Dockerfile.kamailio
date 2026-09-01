@@ -9,24 +9,35 @@ ARG KAMAILIO_BRANCH=feature/ndb_tarantool
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    pkg-config \
+    libmsgpack-dev \
     curl \
     netcat-openbsd \
     ca-certificates \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
-# Копируем модуль ndb_tarantool для Kamailio
-COPY kamailio_tarantool/ndb_tarantool /app/ndb_tarantool
+# Копируем заголовочные файлы ядра Kamailio и модуль ndb_tarantool
+COPY forks/kamailio-master/src/core /app/src/core
+COPY kamailio_tarantool/ndb_tarantool /app/src/modules/ndb_tarantool
 COPY docker/kamailio_entrypoint.c /app/kamailio_entrypoint.c
 
 # Компиляция демона Kamailio с модулем ndb_tarantool
-RUN gcc -Wall -O2 -I/app/ndb_tarantool \
-    /app/ndb_tarantool/tarantool_client.c \
-    /app/ndb_tarantool/tarantool_kemi.c \
-    /app/ndb_tarantool/ndb_tarantool_mod.c \
+RUN cd /app/src/modules/ndb_tarantool && gcc -Wall -O2 \
+    -I. \
+    -I/app/src/core \
+    -I/app/src \
+    -I/app/src/modules/ndb_tarantool \
+    -D__CPU_x86_64 -DFAST_LOCK -DF_MALLOC -DCC_GCC_LIKE_ASM \
+    -DNAME="\"ndb_tarantool.so\"" -DVERSION="\"6.0.0\"" -DARCH="\"x86_64\"" -DOS="\"linux\"" -DOS_QUOTED="\"linux\"" \
+    tarantool_client.c \
+    tarantool_kemi.c \
     /app/kamailio_entrypoint.c \
+    ../../core/basex.c \
+    ../../core/crypto/shautils.c \
+    ../../core/crypto/sha256.c \
+    ../../core/crypto/md5.c \
+    -lmsgpack-c \
     -o /app/kamailio_tnt_daemon
 
 EXPOSE 5060/udp 5060/tcp

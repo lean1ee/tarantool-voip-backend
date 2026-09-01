@@ -1,0 +1,47 @@
+# NDB_TARANTOOL Module for Kamailio
+
+High-Performance Tarantool 3.x In-Memory Connector and KEMI engine for Kamailio SIP Server.
+
+## Features
+
+- **Binary IProto Protocol (Tarantool 3.x)**: Direct zero-copy MessagePack serialization via `libmsgpack-c`.
+- **Process Lifecycle Safety**: Per-worker socket initialization via Kamailio `child_init(int rank)` hooks.
+- **Kamailio Memory Integration**: 100% compliant with Kamailio core memory allocators (`pkg_malloc` and `shm_malloc`).
+- **Authentication**: Native greeting handshake with SHA-1 scramble token exchange (`chap-sha1`).
+- **Failover & Cooldown**: Automatic reconnection with configurable `disable_time` and `allowed_timeouts`.
+- **KEMI Engine**: Rich bindings for Lua (`KSR.tarantool.call`), Python (`KSR.tarantool.call`), and native routing blocks.
+
+## Parameters
+
+### `server` (string)
+Defines a Tarantool connection endpoint. Format:
+```
+modparam("ndb_tarantool", "server", "name=srv1;addr=127.0.0.1;port=3301;user=rtpe;pass=secret;connect_timeout=1000;cmd_timeout=1000")
+```
+
+### `init_without_tarantool` (integer)
+If set to `1`, Kamailio will start even if Tarantool is temporarily offline during initial startup. Default: `0`.
+
+### `connect_timeout` (integer)
+Socket connection timeout in milliseconds. Default: `1000`.
+
+### `cmd_timeout` (integer)
+Read/write command execution timeout in milliseconds. Default: `1000`.
+
+### `disable_time` (integer)
+Failover cooldown duration in seconds. Default: `10`.
+
+## Routing Functions
+
+```c
+tarantool_call("procedure_name", "[params_json]", "$var(res)");
+tarantool_eval("return box.space.calls:count()", "[]", "$var(res)");
+```
+
+## KEMI Usage (Lua / Python)
+
+```lua
+-- Lua KEMI
+local res = KSR.tarantool.call("rtpe_select_node", "[]");
+KSR.xlog.xinfo("Optimal RTPEngine node: " .. res);
+```

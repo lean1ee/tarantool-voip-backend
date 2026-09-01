@@ -91,8 +91,8 @@ int main(int argc, char **argv) {
             snprintf(response, sizeof(response), "%s d8:result2:ok4:porti30002ee", cookie);
         } else if (strcmp(command, "delete") == 0) {
             char call_id[128] = "sample-call-id-12345";
-            rtpe_tarantool_delete_call(tnt_client, call_id, strlen(call_id));
-            printf("[RTPEngine-Tarantool] Call '%s' deleted from Tarantool\n", call_id);
+            int rc = rtpe_tarantool_delete_call(tnt_client, call_id, strlen(call_id));
+            printf("[RTPEngine-Tarantool] Call '%s' deleted from Tarantool (rc=%d)\n", call_id, rc);
 
             snprintf(response, sizeof(response), "%s d8:result2:okee", cookie);
         } else if (strcmp(command, "ping") == 0) {

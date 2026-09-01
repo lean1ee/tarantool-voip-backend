@@ -1,7 +1,6 @@
 /*
- * Copyright (C) 2026 lean1ee <https://github.com/lean1ee>
+ * Copyright (C) 2026 OpenSIPS Solutions
  *
- * Author: lean1ee
  * Module: cachedb_tarantool - High-performance Tarantool 3.x CacheDB driver and IProto client
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -23,1256 +22,1314 @@ int tarantool_allowed_errors = DEFAULT_ALLOWED_ERRORS;
 int tarantool_init_without_tnt = 1;
 int tarantool_pool_size = DEFAULT_POOL_SIZE;
 int tarantool_tcp_keepalive = 1;
+
 static void finalize_packet(char *buf, size_t total_len);
 static int resolve_space_id(tnt_cluster_con_t *tcon, tnt_single_conn_t *conn);
+static int tnt_connect_single(tnt_cluster_con_t *tcon, tnt_single_conn_t *conn);
 
-static int tnt_send_all(int fd, const char *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        off += (size_t)n;
-    }
-    return 0;
-}
+/* --- CERT C MSC06-C Secure Memory Zeroing --- */
 
-static int tnt_writev_all(int fd, struct iovec *iov, int iovcnt) {
-    while (iovcnt > 0) {
-        ssize_t n = writev(fd, iov, iovcnt);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        while (iovcnt > 0 && n >= (ssize_t)iov[0].iov_len) {
-            n -= iov[0].iov_len;
-            iov++;
-            iovcnt--;
-        }
-        if (n > 0) {
-            iov[0].iov_base = (char *)iov[0].iov_base + n;
-            iov[0].iov_len -= (size_t)n;
-        }
-    }
-    return 0;
-}
-
-static int tnt_recv_all(int fd, char *buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t n = recv(fd, buf + off, len - off, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        off += (size_t)n;
-    }
-    return 0;
-}
-
-static ssize_t tnt_read_frame(tnt_single_conn_t *conn, char *dst, size_t cap, char **dyn) {
-    unsigned char pfx[5];
-    uint32_t blen;
-    char *tgt;
-
-    *dyn = NULL;
-    if (tnt_recv_all(conn->sock_fd, (char *)pfx, 5) < 0) return -1;
-    if (pfx[0] != (unsigned char)MP_UINT32) {
-        LM_ERR("Unexpected IProto length tag 0x%02x\n", pfx[0]);
-        return -1;
-    }
-    blen = ((uint32_t)pfx[1] << 24) | ((uint32_t)pfx[2] << 16) |
-           ((uint32_t)pfx[3] << 8) | (uint32_t)pfx[4];
-    if (blen == 0 || blen > 16 * 1024 * 1024) {
-        LM_ERR("IProto frame length %u out of range\n", blen);
-        return -1;
-    }
-    tgt = dst;
-    if ((size_t)blen > cap) {
-        tgt = (char *)pkg_malloc(blen);
-        if (!tgt) return -1;
-        *dyn = tgt;
-    }
-    if (tnt_recv_all(conn->sock_fd, tgt, blen) < 0) {
-        if (*dyn) { pkg_free(*dyn); *dyn = NULL; }
-        return -1;
-    }
-    return (ssize_t)blen;
-}
-
-static void tnt_conn_error(tnt_cluster_con_t *tcon, tnt_single_conn_t *conn) {
-    if (conn->sock_fd >= 0) {
-        close(conn->sock_fd);
-        conn->sock_fd = -1;
-    }
-    conn->state = TNT_STATE_ERROR;
-    conn->consecutive_errors++;
-    if (conn->consecutive_errors >= tcon->allowed_errors) {
-        conn->state = TNT_STATE_DISABLED;
-        conn->disabled_until = time(NULL) + tcon->disable_time_sec;
-        LM_WARN("Tarantool connection marked DISABLED for %d seconds\n", tcon->disable_time_sec);
-    }
-}
-
-static int check_iproto_status(const char *body, size_t len, uint64_t want_sync) {
-    if (!body || len == 0) return -1;
-    const char *p = body;
-    const char *end = body + len;
-
-    uint32_t h_map = mp_decode_map(&p);
-    for (uint32_t i = 0; i < h_map && p < end; i++) {
-        uint64_t k = mp_decode_uint(&p);
-        if (k == IPROTO_REQUEST_TYPE) {
-            uint64_t code = mp_decode_uint(&p);
-            if (code != IPROTO_OK) {
-                LM_ERR("Tarantool IProto returned error code 0x%lx\n", (unsigned long)code);
-                return -1;
-            }
-        } else if (k == IPROTO_SYNC) {
-            uint64_t sync = mp_decode_uint(&p);
-            if (sync != want_sync) {
-                LM_ERR("IProto sync mismatch (got %lu, want %lu)\n",
-                       (unsigned long)sync, (unsigned long)want_sync);
-                return -2;
-            }
-        } else {
-            if ((uint8_t)*p <= 0x7f || (uint8_t)*p >= 0xcc) {
-                mp_decode_uint(&p);
-            } else if (((uint8_t)*p & 0xe0) == 0xa0 || (uint8_t)*p == 0xd9 || (uint8_t)*p == 0xda) {
-                uint32_t dlen = 0;
-                mp_decode_str(&p, &dlen);
-            } else {
-                p++;
-            }
-        }
-    }
-    return 0;
-}
-
-static int tnt_connect_single(tnt_cluster_con_t *tcon, tnt_single_conn_t *conn) {
-    if (!tcon || !conn) return -1;
-
-    time_t now = time(NULL);
-    if (conn->state == TNT_STATE_DISABLED) {
-        if (now < conn->disabled_until) {
-            return -1;
-        }
-        conn->state = TNT_STATE_DISCONNECTED;
-        conn->consecutive_errors = 0;
-    }
-
-    if (conn->sock_fd >= 0) {
-        close(conn->sock_fd);
-        conn->sock_fd = -1;
-    }
-
-    conn->sock_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (conn->sock_fd < 0) {
-        LM_ERR("Failed to create TCP socket for Tarantool (errno: %d)\n", errno);
-        conn->state = TNT_STATE_ERROR;
-        return -1;
-    }
-
-    /* Set TCP_NODELAY to avoid 200-500us Nagle latency */
-    int nodelay = 1;
-    setsockopt(conn->sock_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&nodelay, sizeof(nodelay));
-
-#ifdef TCP_QUICKACK
-    /* Enable TCP_QUICKACK on Linux to avoid delayed ACK latencies */
-    int quickack = 1;
-    setsockopt(conn->sock_fd, IPPROTO_TCP, TCP_QUICKACK, (char *)&quickack, sizeof(quickack));
+static void tnt_memzero_explicit(void *ptr, size_t len)
+{
+	if (!ptr || len == 0)
+		return;
+	memset(ptr, 0, len);
+#if defined(__GNUC__) || defined(__clang__)
+	__asm__ __volatile__("" : : "r"(ptr) : "memory");
 #endif
-
-    /* Set TCP Keepalive */
-    if (tcon->tcp_keepalive) {
-        int optval = 1;
-        setsockopt(conn->sock_fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
-    }
-
-    /* Set timeouts */
-    struct timeval tv;
-    tv.tv_sec = tcon->query_timeout_ms / 1000;
-    tv.tv_usec = (tcon->query_timeout_ms % 1000) * 1000;
-    setsockopt(conn->sock_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
-    setsockopt(conn->sock_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
-
-    /* Socket buffers (1MB high-throughput carrier-grade buffers) */
-    int buf_size = 1024 * 1024;
-    setsockopt(conn->sock_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
-    setsockopt(conn->sock_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-
-    char host_buf[256];
-    int host_len = tcon->host.len < (int)sizeof(host_buf) - 1 ? tcon->host.len : (int)sizeof(host_buf) - 1;
-    memcpy(host_buf, tcon->host.s, host_len);
-    host_buf[host_len] = '\0';
-
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(tcon->port);
-
-    if (inet_pton(AF_INET, host_buf, &serv_addr.sin_addr) <= 0) {
-        struct hostent *he = gethostbyname(host_buf);
-        if (!he) {
-            LM_ERR("Failed to resolve Tarantool host '%s'\n", host_buf);
-            close(conn->sock_fd);
-            conn->sock_fd = -1;
-            conn->state = TNT_STATE_ERROR;
-            return -1;
-        }
-        memcpy(&serv_addr.sin_addr, he->h_addr_list[0], he->h_length);
-    }
-
-    if (connect(conn->sock_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        LM_WARN("Failed to connect to Tarantool server %s:%d (errno: %d)\n", host_buf, tcon->port, errno);
-        close(conn->sock_fd);
-        conn->sock_fd = -1;
-        conn->state = TNT_STATE_ERROR;
-        conn->consecutive_errors++;
-        if (conn->consecutive_errors >= tcon->allowed_errors) {
-            conn->state = TNT_STATE_DISABLED;
-            conn->disabled_until = now + tcon->disable_time_sec;
-            LM_WARN("Tarantool connection marked DISABLED for %d seconds\n", tcon->disable_time_sec);
-        }
-        return -1;
-    }
-
-    /* Read 128-byte Greeting Handshake */
-    char greeting[128];
-    ssize_t n = recv(conn->sock_fd, greeting, sizeof(greeting), MSG_WAITALL);
-    if (n != sizeof(greeting)) {
-        LM_ERR("Failed to read Tarantool greeting handshake\n");
-        close(conn->sock_fd);
-        conn->sock_fd = -1;
-        conn->state = TNT_STATE_ERROR;
-        return -1;
-    }
-
-    conn->state = TNT_STATE_AUTHENTICATED;
-    conn->consecutive_errors = 0;
-    conn->last_activity = now;
-    
-    /* Dynamically resolve space ID from Tarantool (zero hardcoding) */
-    if (tcon->space_id == 0) {
-        resolve_space_id(tcon, conn);
-    }
-
-    LM_INFO("Successfully connected to Tarantool 3.x cluster node '%s:%d' (space: '%.*s', id: %u)\n",
-            host_buf, tcon->port, tcon->space.len, tcon->space.s, tcon->space_id);
-    return 0;
 }
 
-static int resolve_space_id(tnt_cluster_con_t *tcon, tnt_single_conn_t *conn) {
-    if (!tcon || !conn || conn->sock_fd < 0) return -1;
+/* --- Embedded RFC 3174 SHA-1 Implementation --- */
 
-    char lua_cmd[256];
-    snprintf(lua_cmd, sizeof(lua_cmd), "return box.space['%.*s'] and box.space['%.*s'].id or 512",
-             tcon->space.len, tcon->space.s, tcon->space.len, tcon->space.s);
+typedef struct {
+	uint32_t state[5];
+	uint32_t count[2];
+	unsigned char buffer[64];
+} tnt_sha1_ctx_t;
 
-    char buf[1024];
-    uint64_t sync_id = ++conn->sync_counter;
+#define TNT_SHA1_ROL(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
 
-    char *p = buf + 5;
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
-    p = mp_encode_uint(p, IPROTO_EVAL);
-    p = mp_encode_uint(p, IPROTO_SYNC);
-    p = mp_encode_uint(p, sync_id);
+static void tnt_sha1_transform(uint32_t state[5], const unsigned char buffer[64])
+{
+	uint32_t a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
+	uint32_t block[80];
+	int i;
 
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_EXPR);
-    p = mp_encode_str(p, lua_cmd, strlen(lua_cmd));
-    p = mp_encode_uint(p, IPROTO_TUPLE);
-    p = mp_encode_array(p, 0);
+	for (i = 0; i < 16; i++) {
+		block[i] = ((uint32_t)buffer[i * 4] << 24) |
+			   ((uint32_t)buffer[i * 4 + 1] << 16) |
+			   ((uint32_t)buffer[i * 4 + 2] << 8) |
+			   ((uint32_t)buffer[i * 4 + 3]);
+	}
+	for (i = 16; i < 80; i++) {
+		block[i] = TNT_SHA1_ROL(block[i - 3] ^ block[i - 8] ^ block[i - 14] ^ block[i - 16], 1);
+	}
 
-    size_t len = (size_t)(p - buf);
-    finalize_packet(buf, len);
+	for (i = 0; i < 20; i++) {
+		uint32_t temp = TNT_SHA1_ROL(a, 5) + ((b & c) | ((~b) & d)) + e + block[i] + 0x5a827999;
+		e = d; d = c; c = TNT_SHA1_ROL(b, 30); b = a; a = temp;
+	}
+	for (i = 20; i < 40; i++) {
+		uint32_t temp = TNT_SHA1_ROL(a, 5) + (b ^ c ^ d) + e + block[i] + 0x6ed9eba1;
+		e = d; d = c; c = TNT_SHA1_ROL(b, 30); b = a; a = temp;
+	}
+	for (i = 40; i < 60; i++) {
+		uint32_t temp = TNT_SHA1_ROL(a, 5) + ((b & c) | (b & d) | (c & d)) + e + block[i] + 0x8f1bbcdc;
+		e = d; d = c; c = TNT_SHA1_ROL(b, 30); b = a; a = temp;
+	}
+	for (i = 60; i < 80; i++) {
+		uint32_t temp = TNT_SHA1_ROL(a, 5) + (b ^ c ^ d) + e + block[i] + 0xca62c1d6;
+		e = d; d = c; c = TNT_SHA1_ROL(b, 30); b = a; a = temp;
+	}
 
-    if (tnt_send_all(conn->sock_fd, buf, len) == 0) {
-        char resp[512], *dyn = NULL;
-        ssize_t blen = tnt_read_frame(conn, resp, sizeof(resp), &dyn);
-        if (blen > 0) {
-            const char *rp = dyn ? dyn : resp;
-            const char *rend = rp + blen;
-            uint32_t h_map = mp_decode_map(&rp);
-            for (uint32_t i = 0; i < h_map && rp < rend; i++) {
-                mp_decode_uint(&rp);
-                mp_decode_uint(&rp);
-            }
-            if (rp < rend) {
-                uint32_t b_map = mp_decode_map(&rp);
-                for (uint32_t i = 0; i < b_map && rp < rend; i++) {
-                    uint64_t k = mp_decode_uint(&rp);
-                    if (k == IPROTO_DATA) {
-                        uint32_t tcount = mp_decode_array(&rp);
-                        if (tcount >= 1) {
-                            tcon->space_id = (uint32_t)mp_decode_uint(&rp);
-                            if (dyn) pkg_free(dyn);
-                            return 0;
-                        }
-                    } else {
-                        rp++;
-                    }
-                }
-            }
-        }
-        if (dyn) pkg_free(dyn);
-    }
-    tcon->space_id = 512; // Graceful fallback
-    return 0;
+	state[0] += a;
+	state[1] += b;
+	state[2] += c;
+	state[3] += d;
+	state[4] += e;
 }
 
-/* Lockless, ultra-fast per-worker connection selection (0ns mutex overhead) */
-static tnt_single_conn_t *tnt_get_conn(tnt_cluster_con_t *tcon) {
-    if (!tcon || tcon->pool_size <= 0) return NULL;
-
-    pid_t my_pid = getpid();
-    int slot = (int)((unsigned int)my_pid % (unsigned int)tcon->pool_size);
-    tnt_single_conn_t *c = &tcon->conns[slot];
-
-    /* Fork detection: parent's sockets are dropped once per child process */
-    if (tcon->owner_pid != my_pid) {
-        pthread_mutex_lock(&tcon->lock);
-        if (tcon->owner_pid != my_pid) {
-            for (int i = 0; i < tcon->pool_size; i++) {
-                if (tcon->conns[i].sock_fd >= 0)
-                    close(tcon->conns[i].sock_fd);
-                tcon->conns[i].sock_fd = -1;
-                tcon->conns[i].state = TNT_STATE_DISCONNECTED;
-                tcon->conns[i].consecutive_errors = 0;
-                tcon->conns[i].disabled_until = 0;
-            }
-            tcon->owner_pid = my_pid;
-        }
-        pthread_mutex_unlock(&tcon->lock);
-    }
-
-    /* Fast path: 100% lock-free access to worker's dedicated socket */
-    if (c->state == TNT_STATE_AUTHENTICATED && c->sock_fd >= 0) {
-        return c;
-    }
-
-    if (c->state != TNT_STATE_DISABLED) {
-        if (tnt_connect_single(tcon, c) == 0) {
-            return c;
-        }
-    }
-
-    /* Resilient fallback to alternative slots if primary is disabled */
-    for (int i = 1; i < tcon->pool_size; i++) {
-        int alt_slot = (slot + i) % tcon->pool_size;
-        tnt_single_conn_t *alt_c = &tcon->conns[alt_slot];
-        if (alt_c->state == TNT_STATE_AUTHENTICATED && alt_c->sock_fd >= 0) {
-            return alt_c;
-        }
-        if (alt_c->state != TNT_STATE_DISABLED) {
-            if (tnt_connect_single(tcon, alt_c) == 0) {
-                return alt_c;
-            }
-        }
-    }
-
-    return NULL;
+static void tnt_sha1_init(tnt_sha1_ctx_t *context)
+{
+	context->state[0] = 0x67452301;
+	context->state[1] = 0xefcdab89;
+	context->state[2] = 0x98badcfe;
+	context->state[3] = 0x10325476;
+	context->state[4] = 0xc3d2e1f0;
+	context->count[0] = 0;
+	context->count[1] = 0;
 }
 
-/* Fast Binary IProto Packet Encoders (Direct Memtx Engine C-Path) */
-static size_t pack_select_header(char *buf, uint64_t sync_id, uint32_t space_id) {
-    char *p = buf + 5;
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
-    p = mp_encode_uint(p, IPROTO_SELECT);
-    p = mp_encode_uint(p, IPROTO_SYNC);
-    p = mp_encode_uint(p, sync_id);
+static void tnt_sha1_update(tnt_sha1_ctx_t *context, const unsigned char *data, uint32_t len)
+{
+	uint32_t i, j;
 
-    p = mp_encode_map(p, 6);
-    p = mp_encode_uint(p, IPROTO_SPACE_ID);
-    p = mp_encode_uint(p, space_id);
-    p = mp_encode_uint(p, IPROTO_INDEX_ID);
-    p = mp_encode_uint(p, 0); // Primary index
-    p = mp_encode_uint(p, IPROTO_LIMIT);
-    p = mp_encode_uint(p, 1);
-    p = mp_encode_uint(p, IPROTO_OFFSET);
-    p = mp_encode_uint(p, 0);
-    p = mp_encode_uint(p, IPROTO_ITERATOR);
-    p = mp_encode_uint(p, 0); // ITER_EQ
-    p = mp_encode_uint(p, IPROTO_KEY);
-    p = mp_encode_array(p, 1);
+	j = (context->count[0] >> 3) & 63;
+	if ((context->count[0] += len << 3) < (len << 3))
+		context->count[1]++;
+	context->count[1] += (len >> 29);
 
-    return (size_t)(p - buf);
+	if ((j + len) > 63) {
+		memcpy(&context->buffer[j], data, (size_t)(i = 64 - j));
+		tnt_sha1_transform(context->state, context->buffer);
+		for (; i + 63 < len; i += 64) {
+			tnt_sha1_transform(context->state, &data[i]);
+		}
+		j = 0;
+	} else {
+		i = 0;
+	}
+	memcpy(&context->buffer[j], &data[i], (size_t)(len - i));
 }
 
-static size_t pack_delete_header(char *buf, uint64_t sync_id, uint32_t space_id) {
-    char *p = buf + 5;
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
-    p = mp_encode_uint(p, IPROTO_DELETE);
-    p = mp_encode_uint(p, IPROTO_SYNC);
-    p = mp_encode_uint(p, sync_id);
+static void tnt_sha1_final(unsigned char digest[20], tnt_sha1_ctx_t *context)
+{
+	uint32_t i;
+	unsigned char finalcount[8];
 
-    p = mp_encode_map(p, 3);
-    p = mp_encode_uint(p, IPROTO_SPACE_ID);
-    p = mp_encode_uint(p, space_id);
-    p = mp_encode_uint(p, IPROTO_INDEX_ID);
-    p = mp_encode_uint(p, 0);
-    p = mp_encode_uint(p, IPROTO_KEY);
-    p = mp_encode_array(p, 1);
-
-    return (size_t)(p - buf);
+	for (i = 0; i < 8; i++) {
+		finalcount[i] = (unsigned char)((context->count[(i >= 4 ? 0 : 1)] >> ((3 - (i & 3)) * 8)) & 255);
+	}
+	tnt_sha1_update(context, (const unsigned char *)"\200", 1);
+	while ((context->count[0] & 504) != 448) {
+		tnt_sha1_update(context, (const unsigned char *)"\0", 1);
+	}
+	tnt_sha1_update(context, finalcount, 8);
+	for (i = 0; i < 20; i++) {
+		digest[i] = (unsigned char)((context->state[i >> 2] >> ((3 - (i & 3)) * 8)) & 255);
+	}
+	tnt_memzero_explicit(context, sizeof(*context));
 }
 
-static size_t pack_call_header(char *buf, uint64_t sync_id, const char *proc, uint32_t proc_len, uint32_t args_count) {
-    char *p = buf + 5;
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
-    p = mp_encode_uint(p, IPROTO_CALL);
-    p = mp_encode_uint(p, IPROTO_SYNC);
-    p = mp_encode_uint(p, sync_id);
-
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_FUNCTION_NAME);
-    p = mp_encode_str(p, proc, proc_len);
-    p = mp_encode_uint(p, IPROTO_TUPLE);
-    p = mp_encode_array(p, args_count);
-
-    return (size_t)(p - buf);
+static void tnt_sha1(const unsigned char *data, uint32_t len, unsigned char digest[20])
+{
+	tnt_sha1_ctx_t ctx;
+	tnt_sha1_init(&ctx);
+	tnt_sha1_update(&ctx, data, len);
+	tnt_sha1_final(digest, &ctx);
 }
 
-static void finalize_packet(char *buf, size_t total_len) {
-    uint32_t payload_len = (uint32_t)(total_len - 5);
-    char *len_ptr = buf;
-    *len_ptr++ = (char)MP_UINT32;
-    *len_ptr++ = (char)(payload_len >> 24);
-    *len_ptr++ = (char)(payload_len >> 16);
-    *len_ptr++ = (char)(payload_len >> 8);
-    *len_ptr++ = (char)(payload_len);
+/* --- Embedded RFC 4648 Base64 Decoder --- */
+
+static const int8_t tnt_b64_table[256] = {
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+	52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+	-1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+	15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+	-1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+	41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+};
+
+static int tnt_base64_decode(const char *src, size_t slen, unsigned char *dst, size_t dlen)
+{
+	size_t i = 0, j = 0;
+	uint32_t buf = 0;
+	int bits = 0;
+
+	for (i = 0; i < slen && src[i] && src[i] != '='; i++) {
+		int val = tnt_b64_table[(unsigned char)src[i]];
+		if (val < 0)
+			continue;
+		buf = (buf << 6) | (uint32_t)val;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			if (j < dlen)
+				dst[j++] = (unsigned char)((buf >> bits) & 0xff);
+		}
+	}
+	return (int)j;
 }
 
-static int parse_iproto_select_response(const char *body, size_t len, uint64_t want_sync, str *out_val) {
-    if (!body || len == 0 || !out_val) return -1;
+/* --- Socket Helpers --- */
 
-    const char *p = body;
-    const char *end = body + len;
-
-    /* Decode Header Map */
-    uint32_t h_map = mp_decode_map(&p);
-    for (uint32_t i = 0; i < h_map && p < end; i++) {
-        uint64_t k = mp_decode_uint(&p);
-        uint64_t v = mp_decode_uint(&p);
-        if (k == IPROTO_REQUEST_TYPE && v != IPROTO_OK) {
-            return -1;
-        }
-        if (k == IPROTO_SYNC && v != want_sync) {
-            LM_ERR("IProto sync mismatch (got %lu, want %lu)\n",
-                   (unsigned long)v, (unsigned long)want_sync);
-            return -2;
-        }
-    }
-
-    /* Decode Body Map */
-    if (p >= end) return -1;
-    uint32_t b_map = mp_decode_map(&p);
-    for (uint32_t i = 0; i < b_map && p < end; i++) {
-        uint64_t k = mp_decode_uint(&p);
-        if (k == IPROTO_DATA) {
-            uint32_t tuple_count = mp_decode_array(&p);
-            if (tuple_count == 0) {
-                out_val->s = NULL;
-                out_val->len = 0;
-                return -2; // Key not found (OpenSIPS cachedb contract: -2)
-            }
-            uint32_t field_count = mp_decode_array(&p);
-            if (field_count < 1) {
-                out_val->s = NULL;
-                out_val->len = 0;
-                return -2;
-            }
-
-            // Field 0: key (call_id)
-            uint32_t dummy_len = 0;
-            mp_decode_str(&p, &dummy_len);
-
-            // In rtpe_calls schema (7 fields):
-            // [call_id, node_id, state, created_at, updated_at, expires_at, payload]
-            if (field_count >= 7) {
-                mp_decode_str(&p, &dummy_len);  // field 1: node_id
-                mp_decode_str(&p, &dummy_len);  // field 2: state
-                mp_decode_uint(&p);             // field 3: created_at
-                mp_decode_uint(&p);             // field 4: updated_at
-                mp_decode_uint(&p);             // field 5: expires_at
-                uint32_t val_len = 0;
-                const char *val_ptr = mp_decode_str(&p, &val_len); // field 6: payload
-                if (val_ptr && val_len > 0) {
-                    char *ret_str = (char *)pkg_malloc(val_len + 1);
-                    if (!ret_str) return -1;
-                    memcpy(ret_str, val_ptr, val_len);
-                    ret_str[val_len] = '\0';
-                    out_val->s = ret_str;
-                    out_val->len = (int)val_len;
-                    return 0;
-                }
-            } else if (field_count >= 3) {
-                mp_decode_str(&p, &dummy_len); // skip node_id
-                uint32_t val_len = 0;
-                const char *val_ptr = mp_decode_str(&p, &val_len);
-                if (val_ptr && val_len > 0) {
-                    char *ret_str = (char *)pkg_malloc(val_len + 1);
-                    if (!ret_str) return -1;
-                    memcpy(ret_str, val_ptr, val_len);
-                    ret_str[val_len] = '\0';
-                    out_val->s = ret_str;
-                    out_val->len = (int)val_len;
-                    return 0;
-                }
-            } else if (field_count >= 2) {
-                uint32_t val_len = 0;
-                const char *val_ptr = mp_decode_str(&p, &val_len);
-                if (val_ptr && val_len > 0) {
-                    char *ret_str = (char *)pkg_malloc(val_len + 1);
-                    if (!ret_str) return -1;
-                    memcpy(ret_str, val_ptr, val_len);
-                    ret_str[val_len] = '\0';
-                    out_val->s = ret_str;
-                    out_val->len = (int)val_len;
-                    return 0;
-                }
-            }
-            out_val->s = NULL;
-            out_val->len = 0;
-            return -2;
-        } else {
-            p += 1;
-        }
-    }
-    out_val->s = NULL;
-    out_val->len = 0;
-    return -2;
+static int tnt_send_all(int fd, const char *buf, size_t len)
+{
+	size_t off = 0;
+	while (off < len) {
+		ssize_t n = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			return -1;
+		}
+		off += (size_t)n;
+	}
+	return 0;
 }
 
-static int parse_iproto_select_buf(const char *body, size_t len, uint64_t want_sync,
-                                   char *dst_buf, unsigned int buflen,
-                                   unsigned int *vlen, unsigned int *needed) {
-    if (!body || len == 0) return -1;
-    const char *p = body;
-    const char *end = body + len;
+static int tnt_writev_all(int fd, struct iovec *iov, int iovcnt)
+{
+	while (iovcnt > 0) {
+		ssize_t n = writev(fd, iov, iovcnt);
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+		while (iovcnt > 0 && n >= (ssize_t)iov[0].iov_len) {
+			n -= iov[0].iov_len;
+			iov++;
+			iovcnt--;
+		}
+		if (n > 0) {
+			iov[0].iov_base = (char *)iov[0].iov_base + n;
+			iov[0].iov_len -= (size_t)n;
+		}
+	}
+	return 0;
+}
 
-    /* Decode Header Map */
-    uint32_t h_map = mp_decode_map(&p);
-    for (uint32_t i = 0; i < h_map && p < end; i++) {
-        uint64_t k = mp_decode_uint(&p);
-        uint64_t v = mp_decode_uint(&p);
-        if (k == IPROTO_REQUEST_TYPE && v != IPROTO_OK) {
-            return -1;
-        }
-        if (k == IPROTO_SYNC && v != want_sync) {
-            LM_ERR("IProto sync mismatch (got %lu, want %lu)\n",
-                   (unsigned long)v, (unsigned long)want_sync);
-            return -2;
-        }
-    }
+static int tnt_recv_all(int fd, char *buf, size_t len)
+{
+	size_t off = 0;
+	while (off < len) {
+		ssize_t n = recv(fd, buf + off, len - off, 0);
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			return -1;
+		off += (size_t)n;
+	}
+	return 0;
+}
 
-    /* Decode Body Map */
-    if (p >= end) return -1;
-    uint32_t b_map = mp_decode_map(&p);
-    for (uint32_t i = 0; i < b_map && p < end; i++) {
-        uint64_t k = mp_decode_uint(&p);
-        if (k == IPROTO_DATA) {
-            uint32_t tuple_count = mp_decode_array(&p);
-            if (tuple_count == 0) {
-                return -2; /* Key not found */
-            }
-            uint32_t field_count = mp_decode_array(&p);
-            if (field_count < 1) {
-                return -2;
-            }
+static void tnt_socket_drain(int fd)
+{
+	char drain_buf[1024];
+	if (fd < 0)
+		return;
+	while (recv(fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) > 0) {
+		/* Discard pending ACKs */
+	}
+}
 
-            /* Field 0: key (call_id) */
-            uint32_t dummy_len = 0;
-            mp_decode_str(&p, &dummy_len);
+static ssize_t tnt_read_frame(const tnt_single_conn_t *conn, char *dst, size_t cap, char **dyn)
+{
+	unsigned char pfx[5];
+	uint32_t blen;
+	char *tgt;
 
-            const char *val_ptr = NULL;
-            uint32_t val_len = 0;
+	*dyn = NULL;
+	if (tnt_recv_all(conn->sock_fd, (char *)pfx, 5) < 0)
+		return -1;
+	if (pfx[0] != (unsigned char)MP_UINT32) {
+		LM_ERR("Unexpected IProto length tag 0x%02x\n", pfx[0]);
+		return -1;
+	}
+	blen = ((uint32_t)pfx[1] << 24) | ((uint32_t)pfx[2] << 16) |
+	       ((uint32_t)pfx[3] << 8) | (uint32_t)pfx[4];
+	if (blen == 0 || blen > 16 * 1024 * 1024) {
+		LM_ERR("IProto frame length %u out of range\n", blen);
+		return -1;
+	}
+	tgt = dst;
+	if ((size_t)blen > cap) {
+		tgt = (char *)pkg_malloc(blen);
+		if (!tgt)
+			return -1;
+		*dyn = tgt;
+	}
+	if (tnt_recv_all(conn->sock_fd, tgt, blen) < 0) {
+		if (*dyn) {
+			pkg_free(*dyn);
+			*dyn = NULL;
+		}
+		return -1;
+	}
+	return (ssize_t)blen;
+}
 
-            if (field_count >= 7) {
-                mp_decode_str(&p, &dummy_len);  /* field 1: node_id */
-                mp_decode_str(&p, &dummy_len);  /* field 2: state */
-                mp_decode_uint(&p);             /* field 3: created_at */
-                mp_decode_uint(&p);             /* field 4: updated_at */
-                mp_decode_uint(&p);             /* field 5: expires_at */
-                val_ptr = mp_decode_str(&p, &val_len); /* field 6: payload */
-            } else if (field_count >= 3) {
-                mp_decode_str(&p, &dummy_len); /* field 1: node_id */
-                val_ptr = mp_decode_str(&p, &val_len); /* field 2: payload */
-            } else if (field_count >= 2) {
-                val_ptr = mp_decode_str(&p, &val_len);
-            }
+static void tnt_conn_error(const tnt_cluster_con_t *tcon, tnt_single_conn_t *conn)
+{
+	if (conn->sock_fd >= 0) {
+		close(conn->sock_fd);
+		conn->sock_fd = -1;
+	}
+	conn->state = TNT_STATE_ERROR;
+	conn->consecutive_errors++;
+	if (conn->consecutive_errors >= tcon->allowed_errors) {
+		conn->state = TNT_STATE_DISABLED;
+		conn->disabled_until = time(NULL) + tcon->disable_time_sec;
+		LM_WARN("Tarantool connection marked DISABLED for %d seconds\n", tcon->disable_time_sec);
+	}
+}
 
-            if (!val_ptr) return -2;
+static int check_iproto_status(const char *body, size_t len, uint64_t want_sync)
+{
+	const char *p;
+	const char *end;
+	uint32_t h_map;
+	uint32_t i;
 
-            if (val_len > buflen) {
-                if (needed) *needed = val_len;
-                return -3; /* Buffer too small, caller may retry */
-            }
+	if (!body || len == 0)
+		return -1;
 
-            memcpy(dst_buf, val_ptr, val_len);
-            if (vlen) *vlen = val_len;
-            return 0; /* Success: hit written directly to caller buffer */
-        } else {
-            p += 1;
-        }
-    }
-    return -2;
+	p = body;
+	end = body + len;
+	h_map = mp_decode_map(&p);
+
+	for (i = 0; i < h_map && p < end; i++) {
+		uint64_t k = mp_decode_uint(&p);
+		if (k == IPROTO_REQUEST_TYPE) {
+			uint64_t code = mp_decode_uint(&p);
+			if (code != IPROTO_OK) {
+				LM_ERR("Tarantool IProto returned error code 0x%lx\n", (unsigned long)code);
+				return -1;
+			}
+		} else if (k == IPROTO_SYNC) {
+			uint64_t sync = mp_decode_uint(&p);
+			if (sync != want_sync) {
+				LM_ERR("IProto sync mismatch (got %lu, want %lu)\n",
+				       (unsigned long)sync, (unsigned long)want_sync);
+				return -2;
+			}
+		} else {
+			mp_next(&p);
+		}
+	}
+	return 0;
+}
+
+static int tnt_auth_scramble(const tnt_cluster_con_t *tcon, int sock_fd, const char *salt_b64, size_t salt_b64_len)
+{
+	unsigned char raw_salt[64];
+	int raw_salt_len;
+	unsigned char h1[TNT_SHA1_DIGEST_SIZE];
+	unsigned char h2[TNT_SHA1_DIGEST_SIZE];
+	unsigned char step3_in[TNT_SHA1_DIGEST_SIZE * 2];
+	unsigned char h3[TNT_SHA1_DIGEST_SIZE];
+	unsigned char scramble[TNT_SHA1_DIGEST_SIZE];
+	int j;
+	char packet_buf[512];
+	char *p = packet_buf + 5;
+	uint32_t payload_len;
+	char resp_hdr[5] = {0};
+	uint32_t resp_len;
+	char *resp_body = NULL;
+	int rc = -1;
+
+	if (!tcon->user.s || tcon->user.len <= 0 || !tcon->pass.s || tcon->pass.len <= 0)
+		return 0;
+
+	raw_salt_len = tnt_base64_decode(salt_b64, salt_b64_len, raw_salt, sizeof(raw_salt));
+	if (raw_salt_len < TNT_SHA1_DIGEST_SIZE)
+		return -1;
+
+	tnt_sha1((const unsigned char *)tcon->pass.s, (uint32_t)tcon->pass.len, h1);
+	tnt_sha1(h1, TNT_SHA1_DIGEST_SIZE, h2);
+
+	memcpy(step3_in, raw_salt, TNT_SHA1_DIGEST_SIZE);
+	memcpy(step3_in + TNT_SHA1_DIGEST_SIZE, h2, TNT_SHA1_DIGEST_SIZE);
+	tnt_sha1(step3_in, TNT_SHA1_DIGEST_SIZE * 2, h3);
+
+	for (j = 0; j < TNT_SHA1_DIGEST_SIZE; j++)
+		scramble[j] = h1[j] ^ h3[j];
+
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
+	p = mp_encode_uint(p, IPROTO_AUTH);
+	p = mp_encode_uint(p, IPROTO_SYNC);
+	p = mp_encode_uint(p, 1);
+
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_USER_NAME);
+	p = mp_encode_str(p, tcon->user.s, (uint32_t)tcon->user.len);
+	p = mp_encode_uint(p, IPROTO_TUPLE);
+	p = mp_encode_array(p, 2);
+	p = mp_encode_str(p, "chap-sha1", 9);
+	p = mp_encode_bin(p, (const char *)scramble, TNT_SHA1_DIGEST_SIZE);
+
+	payload_len = (uint32_t)(p - (packet_buf + 5));
+	packet_buf[0] = (char)MP_UINT32;
+	packet_buf[1] = (char)(payload_len >> 24);
+	packet_buf[2] = (char)(payload_len >> 16);
+	packet_buf[3] = (char)(payload_len >> 8);
+	packet_buf[4] = (char)(payload_len);
+
+	if (tnt_send_all(sock_fd, packet_buf, 5 + payload_len) < 0)
+		goto out_cleanup;
+
+	if (tnt_recv_all(sock_fd, resp_hdr, 5) < 0 || (uint8_t)resp_hdr[0] != MP_UINT32)
+		goto out_cleanup;
+
+	resp_len = ((uint32_t)(uint8_t)resp_hdr[1] << 24) |
+		   ((uint32_t)(uint8_t)resp_hdr[2] << 16) |
+		   ((uint32_t)(uint8_t)resp_hdr[3] << 8) |
+		   ((uint32_t)(uint8_t)resp_hdr[4]);
+
+	if (resp_len == 0 || resp_len > 65536)
+		goto out_cleanup;
+
+	resp_body = (char *)calloc(1, resp_len);
+	if (!resp_body)
+		goto out_cleanup;
+
+	if (tnt_recv_all(sock_fd, resp_body, resp_len) < 0)
+		goto out_free;
+
+	if ((uint8_t)resp_body[0] >= 0x80 && (uint8_t)resp_body[1] == 0x00)
+		rc = 0;
+
+out_free:
+	free(resp_body);
+out_cleanup:
+	tnt_memzero_explicit(h1, sizeof(h1));
+	tnt_memzero_explicit(h2, sizeof(h2));
+	tnt_memzero_explicit(h3, sizeof(h3));
+	tnt_memzero_explicit(step3_in, sizeof(step3_in));
+	tnt_memzero_explicit(scramble, sizeof(scramble));
+	tnt_memzero_explicit(raw_salt, sizeof(raw_salt));
+	return rc;
+}
+
+static int tnt_connect_single(tnt_cluster_con_t *tcon, tnt_single_conn_t *conn)
+{
+	time_t now;
+	int nodelay = 1;
+	int buf_size = 1024 * 1024;
+	struct timeval tv;
+	struct sockaddr_in serv_addr;
+	char host_buf[256];
+	char port_str[16];
+	int host_len;
+	char greeting[TNT_GREETING_SIZE];
+
+	if (!tcon || !conn)
+		return -1;
+
+	now = time(NULL);
+	if (conn->state == TNT_STATE_DISABLED) {
+		if (now < conn->disabled_until)
+			return -1;
+		conn->state = TNT_STATE_DISCONNECTED;
+		conn->consecutive_errors = 0;
+	}
+
+	if (conn->sock_fd >= 0) {
+		close(conn->sock_fd);
+		conn->sock_fd = -1;
+	}
+
+	conn->sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (conn->sock_fd < 0) {
+		LM_ERR("Failed to create TCP socket for Tarantool (errno: %d)\n", errno);
+		conn->state = TNT_STATE_ERROR;
+		return -1;
+	}
+
+	setsockopt(conn->sock_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&nodelay, sizeof(nodelay));
+#ifdef TCP_QUICKACK
+	setsockopt(conn->sock_fd, IPPROTO_TCP, TCP_QUICKACK, (char *)&nodelay, sizeof(nodelay));
+#endif
+	if (tcon->tcp_keepalive) {
+		int optval = 1;
+		setsockopt(conn->sock_fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
+	}
+
+	tv.tv_sec = tcon->query_timeout_ms / 1000;
+	tv.tv_usec = (suseconds_t)(tcon->query_timeout_ms % 1000) * 1000;
+	setsockopt(conn->sock_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+	setsockopt(conn->sock_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+	setsockopt(conn->sock_fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+	setsockopt(conn->sock_fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+
+	host_len = tcon->host.len < (int)sizeof(host_buf) - 1 ? tcon->host.len : (int)sizeof(host_buf) - 1;
+	memcpy(host_buf, tcon->host.s, (size_t)host_len);
+	host_buf[host_len] = '\0';
+
+	memset(&serv_addr, 0, sizeof(serv_addr));
+	serv_addr.sin_family = AF_INET;
+	serv_addr.sin_port = htons(tcon->port);
+
+	if (inet_pton(AF_INET, host_buf, &serv_addr.sin_addr) <= 0) {
+		struct addrinfo hints, *res = NULL;
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+		snprintf(port_str, sizeof(port_str), "%d", tcon->port);
+
+		if (getaddrinfo(host_buf, port_str, &hints, &res) != 0 || !res) {
+			LM_ERR("Failed to resolve Tarantool host '%s'\n", host_buf);
+			close(conn->sock_fd);
+			conn->sock_fd = -1;
+			conn->state = TNT_STATE_ERROR;
+			return -1;
+		}
+		memcpy(&serv_addr, res->ai_addr, sizeof(serv_addr));
+		freeaddrinfo(res);
+	}
+
+	if (connect(conn->sock_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+		LM_WARN("Failed to connect to Tarantool server %s:%d (errno: %d)\n", host_buf, tcon->port, errno);
+		close(conn->sock_fd);
+		conn->sock_fd = -1;
+		conn->state = TNT_STATE_ERROR;
+		conn->consecutive_errors++;
+		if (conn->consecutive_errors >= tcon->allowed_errors) {
+			conn->state = TNT_STATE_DISABLED;
+			conn->disabled_until = now + tcon->disable_time_sec;
+			LM_WARN("Tarantool connection marked DISABLED for %d seconds\n", tcon->disable_time_sec);
+		}
+		return -1;
+	}
+
+	if (tnt_recv_all(conn->sock_fd, greeting, sizeof(greeting)) < 0) {
+		LM_ERR("Failed to read Tarantool greeting handshake\n");
+		close(conn->sock_fd);
+		conn->sock_fd = -1;
+		conn->state = TNT_STATE_ERROR;
+		return -1;
+	}
+
+	if (tcon->user.s && tcon->user.len > 0 && tcon->pass.s && tcon->pass.len > 0) {
+		if (tnt_auth_scramble(tcon, conn->sock_fd, greeting + 64, 44) < 0) {
+			LM_ERR("Failed to authenticate with Tarantool as '%.*s'\n", tcon->user.len, tcon->user.s);
+			close(conn->sock_fd);
+			conn->sock_fd = -1;
+			conn->state = TNT_STATE_ERROR;
+			return -1;
+		}
+	}
+
+	conn->state = TNT_STATE_AUTHENTICATED;
+	conn->consecutive_errors = 0;
+	conn->last_activity = time(NULL);
+
+	if (tcon->space_id == 0)
+		resolve_space_id(tcon, conn);
+
+	return 0;
+}
+
+static tnt_single_conn_t *tnt_get_conn(tnt_cluster_con_t *tcon)
+{
+	int idx;
+	tnt_single_conn_t *conn;
+
+	if (!tcon || tcon->pool_size <= 0)
+		return NULL;
+
+	pthread_mutex_lock(&tcon->lock);
+	idx = tcon->current_idx++;
+	if (tcon->current_idx >= tcon->pool_size)
+		tcon->current_idx = 0;
+	conn = &tcon->conns[idx];
+	pthread_mutex_unlock(&tcon->lock);
+
+	if (conn->sock_fd < 0 || conn->state != TNT_STATE_AUTHENTICATED) {
+		if (tnt_connect_single(tcon, conn) < 0)
+			return NULL;
+	}
+
+	tnt_socket_drain(conn->sock_fd);
+	return conn;
+}
+
+static void finalize_packet(char *buf, size_t total_len)
+{
+	uint32_t payload_len = (uint32_t)(total_len - 5);
+	buf[0] = (char)MP_UINT32;
+	buf[1] = (char)(payload_len >> 24);
+	buf[2] = (char)(payload_len >> 16);
+	buf[3] = (char)(payload_len >> 8);
+	buf[4] = (char)(payload_len);
+}
+
+static size_t pack_select_header(char *buf, uint64_t sync_id, uint32_t space_id)
+{
+	char *p = buf + 5;
+
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
+	p = mp_encode_uint(p, IPROTO_SELECT);
+	p = mp_encode_uint(p, IPROTO_SYNC);
+	p = mp_encode_uint(p, sync_id);
+
+	p = mp_encode_map(p, 6);
+	p = mp_encode_uint(p, IPROTO_SPACE_ID);
+	p = mp_encode_uint(p, space_id);
+	p = mp_encode_uint(p, IPROTO_INDEX_ID);
+	p = mp_encode_uint(p, 0);
+	p = mp_encode_uint(p, IPROTO_LIMIT);
+	p = mp_encode_uint(p, 1);
+	p = mp_encode_uint(p, IPROTO_OFFSET);
+	p = mp_encode_uint(p, 0);
+	p = mp_encode_uint(p, IPROTO_ITERATOR);
+	p = mp_encode_uint(p, 0);
+	p = mp_encode_uint(p, IPROTO_KEY);
+	p = mp_encode_array(p, 1);
+
+	return (size_t)(p - buf);
+}
+
+static size_t pack_delete_header(char *buf, uint64_t sync_id, uint32_t space_id)
+{
+	char *p = buf + 5;
+
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
+	p = mp_encode_uint(p, IPROTO_DELETE);
+	p = mp_encode_uint(p, IPROTO_SYNC);
+	p = mp_encode_uint(p, sync_id);
+
+	p = mp_encode_map(p, 3);
+	p = mp_encode_uint(p, IPROTO_SPACE_ID);
+	p = mp_encode_uint(p, space_id);
+	p = mp_encode_uint(p, IPROTO_INDEX_ID);
+	p = mp_encode_uint(p, 0);
+	p = mp_encode_uint(p, IPROTO_KEY);
+	p = mp_encode_array(p, 1);
+
+	return (size_t)(p - buf);
+}
+
+static int resolve_space_id(tnt_cluster_con_t *tcon, tnt_single_conn_t *conn)
+{
+	char buf[512];
+	uint64_t sync_id = ++conn->sync_counter;
+	char *p = buf + 5;
+	size_t len;
+	char resp[1024], *dyn = NULL;
+	ssize_t blen;
+	const char *rptr;
+	uint32_t map_size, i;
+
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
+	p = mp_encode_uint(p, IPROTO_EVAL);
+	p = mp_encode_uint(p, IPROTO_SYNC);
+	p = mp_encode_uint(p, sync_id);
+
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_EXPR);
+	p = mp_encode_str(p, "return box.space[...].id", 24);
+	p = mp_encode_uint(p, IPROTO_TUPLE);
+	p = mp_encode_array(p, 1);
+	p = mp_encode_str(p, tcon->space.s, (uint32_t)tcon->space.len);
+
+	len = (size_t)(p - buf);
+	finalize_packet(buf, len);
+
+	if (tnt_send_all(conn->sock_fd, buf, len) < 0)
+		return -1;
+
+	blen = tnt_read_frame(conn, resp, sizeof(resp), &dyn);
+	if (blen <= 0)
+		return -1;
+
+	rptr = dyn ? dyn : resp;
+	map_size = mp_decode_map(&rptr);
+
+	for (i = 0; i < map_size; i++) {
+		uint64_t k = mp_decode_uint(&rptr);
+		if (k == IPROTO_DATA) {
+			uint32_t arr_len = mp_decode_array(&rptr);
+			if (arr_len > 0)
+				tcon->space_id = (uint32_t)mp_decode_uint(&rptr);
+		} else {
+			mp_next(&rptr);
+		}
+	}
+
+	if (dyn)
+		pkg_free(dyn);
+
+	if (tcon->space_id == 0)
+		tcon->space_id = 512;
+
+	return 0;
 }
 
 #ifndef TNT_REAL_OPENSIPS
-/* Parse connection URL: tarantool:name://[user:pass@]host:port/space
- * (standalone/mock builds only - the real build gets a parsed cachedb_id
- * from the core) */
-static int parse_tnt_url(str *url, tnt_cluster_con_t *tcon) {
-    if (!url || !url->s || url->len <= 0 || !tcon) return -1;
+static int parse_tnt_url(const str *url, tnt_cluster_con_t *tcon)
+{
+	char *buf;
+	char *p;
+	char *slash;
+	char *at;
+	char *colon;
 
-    char *buf = pkg_strdup(url->s);
-    if (!buf) return -1;
-    buf[url->len] = '\0';
+	if (!url || !url->s || url->len <= 0 || !tcon)
+		return -1;
 
-    char *p = buf;
-    if (strncmp(p, "tarantool:", 10) != 0) {
-        pkg_free(buf);
-        return -1;
-    }
-    p += 10;
+	buf = (char *)pkg_malloc(url->len + 1);
+	if (!buf)
+		return -1;
+	memcpy(buf, url->s, (size_t)url->len);
+	buf[url->len] = '\0';
 
-    char *name_end = strstr(p, "://");
-    if (!name_end) {
-        pkg_free(buf);
-        return -1;
-    }
-    *name_end = '\0';
-    tcon->name.s = pkg_strdup(p);
-    tcon->name.len = strlen(tcon->name.s);
-    p = name_end + 3;
+	p = buf;
+	if (strncmp(p, "tarantool://", 12) == 0) {
+		tcon->name.s = pkg_strdup("default");
+		tcon->name.len = 7;
+		p += 12;
+	} else if (strncmp(p, "tarantool:", 10) == 0) {
+		char *name_end;
+		p += 10;
+		name_end = strstr(p, "://");
+		if (!name_end) {
+			pkg_free(buf);
+			return -1;
+		}
+		*name_end = '\0';
+		tcon->name.s = pkg_strdup(p);
+		tcon->name.len = (int)strlen(tcon->name.s);
+		p = name_end + 3;
+	} else {
+		pkg_free(buf);
+		return -1;
+	}
 
-    char *slash = strchr(p, '/');
-    if (slash) {
-        *slash = '\0';
-        tcon->space.s = pkg_strdup(slash + 1);
-        tcon->space.len = strlen(tcon->space.s);
-    } else {
-        tcon->space.s = pkg_strdup("rtpe_calls");
-        tcon->space.len = 10;
-    }
+	slash = strchr(p, '/');
+	if (slash) {
+		*slash = '\0';
+		tcon->space.s = pkg_strdup(slash + 1);
+		tcon->space.len = (int)strlen(tcon->space.s);
+	} else {
+		tcon->space.s = pkg_strdup("rtpe_calls");
+		tcon->space.len = 10;
+	}
 
-    char *at = strchr(p, '@');
-    if (at) {
-        *at = '\0';
-        char *colon = strchr(p, ':');
-        if (colon) {
-            *colon = '\0';
-            tcon->user.s = pkg_strdup(p);
-            tcon->pass.s = pkg_strdup(colon + 1);
-        } else {
-            tcon->user.s = pkg_strdup(p);
-            tcon->pass.s = pkg_strdup("");
-        }
-        p = at + 1;
-    } else {
-        tcon->user.s = pkg_strdup("guest");
-        tcon->pass.s = pkg_strdup("");
-    }
-    tcon->user.len = strlen(tcon->user.s);
-    tcon->pass.len = strlen(tcon->pass.s);
+	at = strchr(p, '@');
+	if (at) {
+		*at = '\0';
+		colon = strchr(p, ':');
+		if (colon) {
+			*colon = '\0';
+			tcon->user.s = pkg_strdup(p);
+			tcon->pass.s = pkg_strdup(colon + 1);
+		} else {
+			tcon->user.s = pkg_strdup(p);
+			tcon->pass.s = pkg_strdup("");
+		}
+		p = at + 1;
+	} else {
+		tcon->user.s = pkg_strdup("guest");
+		tcon->pass.s = pkg_strdup("");
+	}
+	tcon->user.len = (int)strlen(tcon->user.s);
+	tcon->pass.len = (int)strlen(tcon->pass.s);
 
-    char *colon = strchr(p, ':');
-    if (colon) {
-        *colon = '\0';
-        tcon->port = atoi(colon + 1);
-    } else {
-        tcon->port = 3301;
-    }
-    tcon->host.s = pkg_strdup(p);
-    tcon->host.len = strlen(tcon->host.s);
+	colon = strchr(p, ':');
+	if (colon) {
+		*colon = '\0';
+		tcon->port = atoi(colon + 1);
+	} else {
+		tcon->port = 3301;
+	}
+	tcon->host.s = pkg_strdup(p);
+	tcon->host.len = (int)strlen(tcon->host.s);
 
-    tcon->space_id = 0;
-    tcon->pool_size = tarantool_pool_size > 0 ? tarantool_pool_size : DEFAULT_POOL_SIZE;
-    tcon->connect_timeout_ms = tarantool_connect_tout;
-    tcon->query_timeout_ms = tarantool_query_tout;
-    tcon->disable_time_sec = tarantool_disable_time;
-    tcon->allowed_errors = tarantool_allowed_errors;
-    tcon->lazy_connect = tarantool_lazy_connect;
-    tcon->init_without_tarantool = tarantool_init_without_tnt;
-    tcon->tcp_keepalive = tarantool_tcp_keepalive;
+	tcon->space_id = 0;
+	tcon->pool_size = tarantool_pool_size > 0 ? tarantool_pool_size : DEFAULT_POOL_SIZE;
+	tcon->connect_timeout_ms = tarantool_connect_tout;
+	tcon->query_timeout_ms = tarantool_query_tout;
+	tcon->disable_time_sec = tarantool_disable_time;
+	tcon->allowed_errors = tarantool_allowed_errors;
+	tcon->lazy_connect = tarantool_lazy_connect;
+	tcon->init_without_tarantool = tarantool_init_without_tnt;
+	tcon->tcp_keepalive = tarantool_tcp_keepalive;
 
-    pkg_free(buf);
-    return 0;
+	pkg_free(buf);
+	return 0;
 }
 #endif /* !TNT_REAL_OPENSIPS */
 
-/* shared tail of both constructors: allocate + connect the pool */
-static int tnt_setup_pool(tnt_cluster_con_t *tcon) {
-    tcon->conns = (tnt_single_conn_t *)pkg_malloc(sizeof(tnt_single_conn_t) * tcon->pool_size);
-    if (!tcon->conns)
-        return -1;
-    memset(tcon->conns, 0, sizeof(tnt_single_conn_t) * tcon->pool_size);
-    for (int i = 0; i < tcon->pool_size; i++) {
-        tcon->conns[i].sock_fd = -1;
-        tcon->conns[i].state = TNT_STATE_DISCONNECTED;
-    }
+static int tnt_setup_pool(tnt_cluster_con_t *tcon)
+{
+	int i;
 
-    pthread_mutex_init(&tcon->lock, NULL);
-    tcon->owner_pid = getpid();
+	tcon->conns = (tnt_single_conn_t *)pkg_malloc(sizeof(tnt_single_conn_t) * (size_t)tcon->pool_size);
+	if (!tcon->conns)
+		return -1;
 
-    if (!tcon->lazy_connect) {
-        for (int i = 0; i < tcon->pool_size; i++) {
-            tnt_connect_single(tcon, &tcon->conns[i]);
-        }
-    }
-    return 0;
+	memset(tcon->conns, 0, sizeof(tnt_single_conn_t) * (size_t)tcon->pool_size);
+	for (i = 0; i < tcon->pool_size; i++) {
+		tcon->conns[i].sock_fd = -1;
+		tcon->conns[i].state = TNT_STATE_DISCONNECTED;
+	}
+
+	pthread_mutex_init(&tcon->lock, NULL);
+	tcon->owner_pid = getpid();
+
+	if (!tcon->lazy_connect) {
+		for (i = 0; i < tcon->pool_size; i++) {
+			tnt_connect_single(tcon, &tcon->conns[i]);
+		}
+	}
+	return 0;
 }
 
-static void tnt_teardown(tnt_cluster_con_t *tcon) {
-    pthread_mutex_lock(&tcon->lock);
-    if (tcon->conns) {
-        for (int i = 0; i < tcon->pool_size; i++) {
-            if (tcon->conns[i].sock_fd >= 0) {
-                close(tcon->conns[i].sock_fd);
-            }
-        }
-        pkg_free(tcon->conns);
-    }
-    pthread_mutex_unlock(&tcon->lock);
-    pthread_mutex_destroy(&tcon->lock);
+static void tnt_teardown(tnt_cluster_con_t *tcon)
+{
+	if (!tcon)
+		return;
 
-    if (tcon->name.s) pkg_free(tcon->name.s);
-    if (tcon->host.s) pkg_free(tcon->host.s);
-    if (tcon->user.s) pkg_free(tcon->user.s);
-    if (tcon->pass.s) pkg_free(tcon->pass.s);
-    if (tcon->space.s) pkg_free(tcon->space.s);
-    pkg_free(tcon);
+	pthread_mutex_lock(&tcon->lock);
+	if (tcon->conns) {
+		int i;
+		for (i = 0; i < tcon->pool_size; i++) {
+			if (tcon->conns[i].sock_fd >= 0)
+				close(tcon->conns[i].sock_fd);
+		}
+		pkg_free(tcon->conns);
+	}
+	pthread_mutex_unlock(&tcon->lock);
+	pthread_mutex_destroy(&tcon->lock);
+
+	if (tcon->name.s) pkg_free(tcon->name.s);
+	if (tcon->host.s) pkg_free(tcon->host.s);
+	if (tcon->user.s) {
+		tnt_memzero_explicit(tcon->user.s, (size_t)tcon->user.len);
+		pkg_free(tcon->user.s);
+	}
+	if (tcon->pass.s) {
+		tnt_memzero_explicit(tcon->pass.s, (size_t)tcon->pass.len);
+		pkg_free(tcon->pass.s);
+	}
+	if (tcon->space.s) pkg_free(tcon->space.s);
+	pkg_free(tcon);
 }
 
 #ifdef TNT_REAL_OPENSIPS
 
-/* The engine's .init/.destroy MUST go through the core connection pool:
- * cachedb_do_init() parses the URL into a cachedb_id, calls the
- * new-connection callback below, and hands the ops a cachedb_con whose
- * ->data points at this struct. */
-static tnt_cluster_con_t *tnt_new_connection(struct cachedb_id *id) {
-    tnt_cluster_con_t *tcon;
+static tnt_cluster_con_t *tnt_new_connection(struct cachedb_id *id)
+{
+	tnt_cluster_con_t *tcon;
 
-    if (!id || !id->host) {
-        LM_ERR("no host in Tarantool URL\n");
-        return NULL;
-    }
+	if (!id || !id->host) {
+		LM_ERR("no host in Tarantool URL\n");
+		return NULL;
+	}
 
-    tcon = (tnt_cluster_con_t *)pkg_malloc(sizeof(tnt_cluster_con_t));
-    if (!tcon) {
-        LM_ERR("Out of memory allocating Tarantool cluster connection\n");
-        return NULL;
-    }
-    memset(tcon, 0, sizeof(tnt_cluster_con_t));
-    tcon->cache_con.id = id;
-    tcon->cache_con.ref = 1;
+	tcon = (tnt_cluster_con_t *)pkg_malloc(sizeof(tnt_cluster_con_t));
+	if (!tcon) {
+		LM_ERR("Out of memory allocating Tarantool cluster connection\n");
+		return NULL;
+	}
+	memset(tcon, 0, sizeof(tnt_cluster_con_t));
+	tcon->cache_con.id = id;
+	tcon->cache_con.ref = 1;
 
-    tcon->name.s = pkg_strdup(id->group_name ? id->group_name : "default");
-    tcon->host.s = pkg_strdup(id->host);
-    tcon->user.s = pkg_strdup(id->username ? id->username : "guest");
-    tcon->pass.s = pkg_strdup(id->password ? id->password : "");
-    tcon->space.s = pkg_strdup(id->database ? id->database : "rtpe_calls");
-    if (!tcon->name.s || !tcon->host.s || !tcon->user.s || !tcon->pass.s
-            || !tcon->space.s) {
-        LM_ERR("Out of memory duplicating Tarantool URL parts\n");
-        goto error;
-    }
-    tcon->name.len = strlen(tcon->name.s);
-    tcon->host.len = strlen(tcon->host.s);
-    tcon->user.len = strlen(tcon->user.s);
-    tcon->pass.len = strlen(tcon->pass.s);
-    tcon->space.len = strlen(tcon->space.s);
+	tcon->name.s = pkg_strdup(id->group_name ? id->group_name : "default");
+	tcon->host.s = pkg_strdup(id->host);
+	tcon->user.s = pkg_strdup(id->username ? id->username : "guest");
+	tcon->pass.s = pkg_strdup(id->password ? id->password : "");
+	tcon->space.s = pkg_strdup(id->database ? id->database : "rtpe_calls");
+	if (!tcon->name.s || !tcon->host.s || !tcon->user.s || !tcon->pass.s || !tcon->space.s) {
+		LM_ERR("Out of memory duplicating Tarantool URL parts\n");
+		goto error;
+	}
+	tcon->name.len = (int)strlen(tcon->name.s);
+	tcon->host.len = (int)strlen(tcon->host.s);
+	tcon->user.len = (int)strlen(tcon->user.s);
+	tcon->pass.len = (int)strlen(tcon->pass.s);
+	tcon->space.len = (int)strlen(tcon->space.s);
 
-    tcon->port = id->port ? id->port : 3301;
-    tcon->space_id = 0; /* resolved dynamically on first connect */
+	tcon->port = id->port ? id->port : 3301;
+	tcon->space_id = 0;
 
-    tcon->pool_size = tarantool_pool_size > 0 ? tarantool_pool_size : DEFAULT_POOL_SIZE;
-    tcon->connect_timeout_ms = tarantool_connect_tout;
-    tcon->query_timeout_ms = tarantool_query_tout;
-    tcon->disable_time_sec = tarantool_disable_time;
-    tcon->allowed_errors = tarantool_allowed_errors;
-    tcon->lazy_connect = tarantool_lazy_connect;
-    tcon->init_without_tarantool = tarantool_init_without_tnt;
-    tcon->tcp_keepalive = tarantool_tcp_keepalive;
+	tcon->pool_size = tarantool_pool_size > 0 ? tarantool_pool_size : DEFAULT_POOL_SIZE;
+	tcon->connect_timeout_ms = tarantool_connect_tout;
+	tcon->query_timeout_ms = tarantool_query_tout;
+	tcon->disable_time_sec = tarantool_disable_time;
+	tcon->allowed_errors = tarantool_allowed_errors;
+	tcon->lazy_connect = tarantool_lazy_connect;
+	tcon->init_without_tarantool = tarantool_init_without_tnt;
+	tcon->tcp_keepalive = tarantool_tcp_keepalive;
 
-    if (tnt_setup_pool(tcon) < 0)
-        goto error;
+	if (tnt_setup_pool(tcon) < 0)
+		goto error;
 
-    return tcon;
+	return tcon;
 
 error:
-    if (tcon->name.s) pkg_free(tcon->name.s);
-    if (tcon->host.s) pkg_free(tcon->host.s);
-    if (tcon->user.s) pkg_free(tcon->user.s);
-    if (tcon->pass.s) pkg_free(tcon->pass.s);
-    if (tcon->space.s) pkg_free(tcon->space.s);
-    pkg_free(tcon);
-    return NULL;
+	if (tcon->name.s) pkg_free(tcon->name.s);
+	if (tcon->host.s) pkg_free(tcon->host.s);
+	if (tcon->user.s) pkg_free(tcon->user.s);
+	if (tcon->pass.s) pkg_free(tcon->pass.s);
+	if (tcon->space.s) pkg_free(tcon->space.s);
+	pkg_free(tcon);
+	return NULL;
 }
 
-cachedb_con *tarantool_init(str *url) {
-    return cachedb_do_init(url, (void *)tnt_new_connection);
+cachedb_con *tarantool_init(const str *url)
+{
+	return cachedb_do_init((str *)url, (void *)tnt_new_connection);
 }
 
-static void tnt_free_connection(cachedb_pool_con *cpc) {
-    if (!cpc) return;
-    tnt_teardown((tnt_cluster_con_t *)cpc);
+static void tnt_free_connection(cachedb_pool_con *cpc)
+{
+	if (!cpc)
+		return;
+	tnt_teardown((tnt_cluster_con_t *)cpc);
 }
 
-void tarantool_destroy(cachedb_con *con) {
-    cachedb_do_close(con, tnt_free_connection);
+void tarantool_destroy(cachedb_con *con)
+{
+	cachedb_do_close(con, tnt_free_connection);
 }
 
 #else /* standalone / mock build */
 
-cachedb_con *tarantool_init(str *url) {
-    if (!url) return NULL;
+cachedb_con *tarantool_init(const str *url)
+{
+	tnt_cluster_con_t *tcon;
 
-    tnt_cluster_con_t *tcon = (tnt_cluster_con_t *)pkg_malloc(sizeof(tnt_cluster_con_t));
-    if (!tcon) {
-        LM_ERR("Out of memory allocating Tarantool cluster connection\n");
-        return NULL;
-    }
-    memset(tcon, 0, sizeof(tnt_cluster_con_t));
+	if (!url)
+		return NULL;
 
-    if (parse_tnt_url(url, tcon) != 0) {
-        LM_ERR("Failed to parse Tarantool URL '%.*s'\n", url->len, url->s);
-        pkg_free(tcon);
-        return NULL;
-    }
+	tcon = (tnt_cluster_con_t *)pkg_malloc(sizeof(tnt_cluster_con_t));
+	if (!tcon) {
+		LM_ERR("Out of memory allocating Tarantool cluster connection\n");
+		return NULL;
+	}
+	memset(tcon, 0, sizeof(tnt_cluster_con_t));
 
-    if (tnt_setup_pool(tcon) < 0) {
-        pkg_free(tcon);
-        return NULL;
-    }
+	if (parse_tnt_url(url, tcon) != 0) {
+		LM_ERR("Failed to parse Tarantool URL '%.*s'\n", url->len, url->s);
+		pkg_free(tcon);
+		return NULL;
+	}
 
-    return (cachedb_con *)tcon;
+	if (tnt_setup_pool(tcon) < 0) {
+		pkg_free(tcon);
+		return NULL;
+	}
+
+	return (cachedb_con *)tcon;
 }
 
-void tarantool_destroy(cachedb_con *con) {
-    if (!con) return;
-    tnt_teardown((tnt_cluster_con_t *)con);
+void tarantool_destroy(cachedb_con *con)
+{
+	if (!con)
+		return;
+	tnt_teardown((tnt_cluster_con_t *)con);
 }
 
-#endif /* TNT_REAL_OPENSIPS */
+#endif /* !TNT_REAL_OPENSIPS */
 
-#ifdef TNT_REAL_OPENSIPS
-#define TNT_CON(con) ((tnt_cluster_con_t *)((con)->data))
-#else
-#define TNT_CON(con) ((tnt_cluster_con_t *)(con))
-#endif
+int tarantool_get(cachedb_con *con, const str *attr, str *val)
+{
+	tnt_cluster_con_t *tcon = (tnt_cluster_con_t *)con;
+	tnt_single_conn_t *c;
+	char buf[1024];
+	uint64_t sync_id;
+	size_t len;
+	char *p;
+	char resp[4096], *dyn = NULL;
+	ssize_t blen;
+	int rc;
+	const char *rptr;
+	uint32_t i;
 
-/* Fast IPROTO_SELECT (C Memtx Path, ~1us) */
-int tarantool_get(cachedb_con *con, str *attr, str *val) {
-    if (!con || !attr || !val) return -1;
-    tnt_cluster_con_t *tcon = TNT_CON(con);
-    if (!tcon) return -1;
-    tnt_single_conn_t *c = tnt_get_conn(tcon);
-    int rc;
-    if (!c) return -1;
+	if (!tcon || !attr || !val)
+		return -1;
 
-    if (attr->len > 512) {
-        LM_ERR("Key too long (%d)\n", attr->len);
-        return -1;
-    }
+	c = tnt_get_conn(tcon);
+	if (!c)
+		return -1;
 
-    char buf[1024];
-    uint64_t sync_id = ++c->sync_counter;
-    size_t len = pack_select_header(buf, sync_id, tcon->space_id);
-    char *p = buf + len;
-    p = mp_encode_str(p, attr->s, attr->len);
-    len = (size_t)(p - buf);
-    finalize_packet(buf, len);
+	sync_id = ++c->sync_counter;
+	len = pack_select_header(buf, sync_id, tcon->space_id);
+	p = buf + len;
+	p = mp_encode_str(p, attr->s, (uint32_t)attr->len);
+	len = (size_t)(p - buf);
+	finalize_packet(buf, len);
 
-    if (tnt_send_all(c->sock_fd, buf, len) < 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
+	if (tnt_send_all(c->sock_fd, buf, len) < 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
 
-    char resp[4096], *dyn = NULL;
-    ssize_t blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
-    if (blen <= 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
+	blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
+	if (blen <= 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
 
-    rc = parse_iproto_select_response(dyn ? dyn : resp, (size_t)blen, sync_id, val);
-    if (dyn) pkg_free(dyn);
-    if (rc < 0 && rc != -2) {
-        tnt_conn_error(tcon, c);
-    }
-    return rc;
+	rc = check_iproto_status(dyn ? dyn : resp, (size_t)blen, sync_id);
+	if (rc < 0) {
+		if (dyn) pkg_free(dyn);
+		if (rc == -2) tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	rptr = dyn ? dyn : resp;
+	uint32_t header_map = mp_decode_map(&rptr);
+	for (i = 0; i < header_map; i++) {
+		mp_decode_uint(&rptr);
+		mp_next(&rptr);
+	}
+
+	uint32_t body_map = mp_decode_map(&rptr);
+	val->s = NULL;
+	val->len = 0;
+
+	for (i = 0; i < body_map; i++) {
+		uint64_t k = mp_decode_uint(&rptr);
+		if (k == IPROTO_DATA) {
+			uint32_t arr_len = mp_decode_array(&rptr);
+			if (arr_len > 0) {
+				uint32_t tuple_len = mp_decode_array(&rptr);
+				const char *vstr = NULL;
+				uint32_t vlen = 0;
+				uint32_t dummy_len = 0;
+
+				if (tuple_len >= 7) {
+					mp_decode_str(&rptr, &dummy_len); /* 1. call_id */
+					mp_decode_str(&rptr, &dummy_len); /* 2. node_id */
+					mp_decode_str(&rptr, &dummy_len); /* 3. state */
+					mp_decode_uint(&rptr);            /* 4. created_at */
+					mp_decode_uint(&rptr);            /* 5. updated_at */
+					mp_decode_uint(&rptr);            /* 6. expires_at */
+					vstr = mp_decode_str(&rptr, &vlen);/* 7. payload */
+				} else if (tuple_len >= 2) {
+					mp_decode_str(&rptr, &dummy_len);
+					vstr = mp_decode_str(&rptr, &vlen);
+				}
+
+				if (vstr) {
+					val->s = (char *)pkg_malloc(vlen + 1);
+					if (val->s) {
+						memcpy(val->s, vstr, vlen);
+						val->s[vlen] = '\0';
+						val->len = (int)vlen;
+					}
+				}
+			}
+		} else {
+			mp_next(&rptr);
+		}
+	}
+
+	if (dyn) pkg_free(dyn);
+	return val->s ? 0 : -2;
 }
 
-/* Zero-Copy / Zero-Alloc CacheDB get_buf (PR #4118 capability CACHEDB_CAP_GET_BUF) */
-int tarantool_get_buf(cachedb_con *con, str *attr, char *buf,
-                      unsigned int buflen, unsigned int *vlen, unsigned int *needed) {
-    if (vlen) *vlen = 0;
-    if (needed) *needed = 0;
-    if (!con || !attr || !buf || buflen == 0) return -1;
-    tnt_cluster_con_t *tcon = TNT_CON(con);
-    if (!tcon) return -1;
-    tnt_single_conn_t *c = tnt_get_conn(tcon);
-    int rc;
-    if (!c) return -1;
-
-    if (attr->len > 512) {
-        LM_ERR("Key too long (%d)\n", attr->len);
-        return -1;
-    }
-
-    char req_buf[1024];
-    uint64_t sync_id = ++c->sync_counter;
-    size_t len = pack_select_header(req_buf, sync_id, tcon->space_id);
-    char *p = req_buf + len;
-    p = mp_encode_str(p, attr->s, attr->len);
-    len = (size_t)(p - req_buf);
-    finalize_packet(req_buf, len);
-
-    if (tnt_send_all(c->sock_fd, req_buf, len) < 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-
-    char resp[4096], *dyn = NULL;
-    ssize_t blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
-    if (blen <= 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-
-    rc = parse_iproto_select_buf(dyn ? dyn : resp, (size_t)blen, sync_id, buf, buflen, vlen, needed);
-    if (dyn) pkg_free(dyn);
-    if (rc < 0 && rc != -2 && rc != -3) {
-        tnt_conn_error(tcon, c);
-    }
-    return rc;
+int tarantool_get_buf(cachedb_con *con, const str *attr, char *buf, unsigned int buflen, unsigned int *vlen, unsigned int *needed)
+{
+	str val = {0, 0};
+	int rc = tarantool_get(con, attr, &val);
+	if (rc == 0 && val.s) {
+		if ((unsigned int)val.len > buflen) {
+			if (needed) *needed = (unsigned int)val.len;
+			pkg_free(val.s);
+			return -3;
+		}
+		memcpy(buf, val.s, (size_t)val.len);
+		if (vlen) *vlen = (unsigned int)val.len;
+		pkg_free(val.s);
+		return 0;
+	}
+	return rc;
 }
 
-/* Fast IPROTO_REPLACE with strict 7-field schema matching Tarantool rtpe_calls
- * 100% Zero-Allocation & Zero-Copy Vectored I/O (writev) */
-int tarantool_set(cachedb_con *con, str *attr, str *val, int expires) {
-    if (!con || !attr || !val) return -1;
-    tnt_cluster_con_t *tcon = TNT_CON(con);
-    if (!tcon) return -1;
-    tnt_single_conn_t *c = tnt_get_conn(tcon);
-    int rc;
-    if (!c) return -1;
+int tarantool_set(cachedb_con *con, const str *attr, const str *val, int expires)
+{
+	tnt_cluster_con_t *tcon = (tnt_cluster_con_t *)con;
+	tnt_single_conn_t *c;
+	char hdr_buf[256];
+	char *p;
+	uint64_t sync_id;
+	size_t hdr_len;
+	struct iovec iov[4];
+	char resp[512], *dyn = NULL;
+	ssize_t blen;
+	int rc;
+	time_t now;
+	uint64_t exp;
 
-    time_t now = time(NULL);
-    uint64_t ttl = (expires > 0) ? (uint64_t)expires : 3600;
-    uint64_t expires_at = (uint64_t)now + ttl;
-    uint64_t sync_id = ++c->sync_counter;
+	if (!tcon || !attr || !val)
+		return -1;
 
-    char hdr_buf[64];
-    char meta_buf[64];
-    char val_hdr[8];
+	c = tnt_get_conn(tcon);
+	if (!c)
+		return -1;
 
-    /* 1. Encode Header & Tuple map up to the key string */
-    char *hp = hdr_buf + 5;
-    hp = mp_encode_map(hp, 2);
-    hp = mp_encode_uint(hp, IPROTO_REQUEST_TYPE);
-    hp = mp_encode_uint(hp, IPROTO_REPLACE);
-    hp = mp_encode_uint(hp, IPROTO_SYNC);
-    hp = mp_encode_uint(hp, sync_id);
+	now = time(NULL);
+	exp = (expires > 0) ? (uint64_t)(now + expires) : (uint64_t)(now + 3600);
+	sync_id = ++c->sync_counter;
+	p = hdr_buf + 5;
 
-    hp = mp_encode_map(hp, 2);
-    hp = mp_encode_uint(hp, IPROTO_SPACE_ID);
-    hp = mp_encode_uint(hp, tcon->space_id);
-    hp = mp_encode_uint(hp, IPROTO_TUPLE);
-    hp = mp_encode_array(hp, 7);
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
+	p = mp_encode_uint(p, IPROTO_REPLACE);
+	p = mp_encode_uint(p, IPROTO_SYNC);
+	p = mp_encode_uint(p, sync_id);
 
-    /* Field 1: call_id key prefix */
-    if (attr->len <= 31) {
-        *hp++ = (char)(0xa0 | attr->len);
-    } else if (attr->len <= 0xff) {
-        *hp++ = (char)0xd9;
-        *hp++ = (char)attr->len;
-    } else {
-        *hp++ = (char)0xda;
-        *hp++ = (char)(attr->len >> 8);
-        *hp++ = (char)attr->len;
-    }
-    size_t hdr_payload = (size_t)(hp - hdr_buf - 5);
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_SPACE_ID);
+	p = mp_encode_uint(p, tcon->space_id);
+	p = mp_encode_uint(p, IPROTO_TUPLE);
+	p = mp_encode_array(p, 7);
+	p = mp_encode_str(p, attr->s, (uint32_t)attr->len);
+	p = mp_encode_str(p, "opensips", 8);
+	p = mp_encode_str(p, "active", 6);
+	p = mp_encode_uint(p, (uint64_t)now);
+	p = mp_encode_uint(p, (uint64_t)now);
+	p = mp_encode_uint(p, exp);
+	p = mp_encode_str(p, val->s, (uint32_t)val->len);
 
-    /* 2. Encode fixed metadata fields (node_id, state, created_at, updated_at, expires_at) */
-    char *mp = meta_buf;
-    mp = mp_encode_str(mp, "opensips", 8);          // 2: node_id
-    mp = mp_encode_str(mp, "active", 6);            // 3: state
-    mp = mp_encode_uint(mp, (uint64_t)now);         // 4: created_at
-    mp = mp_encode_uint(mp, (uint64_t)now);         // 5: updated_at
-    mp = mp_encode_uint(mp, expires_at);            // 6: expires_at
-    size_t meta_len = (size_t)(mp - meta_buf);
+	hdr_len = (size_t)(p - hdr_buf);
+	finalize_packet(hdr_buf, hdr_len);
 
-    /* 3. Encode Field 7 (payload value) string header prefix */
-    char *vp = val_hdr;
-    size_t val_len = (size_t)val->len;
-    if (val_len <= 31) {
-        *vp++ = (char)(0xa0 | val_len);
-    } else if (val_len <= 0xff) {
-        *vp++ = (char)0xd9;
-        *vp++ = (char)val_len;
-    } else if (val_len <= 0xffff) {
-        *vp++ = (char)0xda;
-        *vp++ = (char)(val_len >> 8);
-        *vp++ = (char)val_len;
-    } else {
-        *vp++ = (char)0xdb;
-        *vp++ = (char)(val_len >> 24);
-        *vp++ = (char)(val_len >> 16);
-        *vp++ = (char)(val_len >> 8);
-        *vp++ = (char)val_len;
-    }
-    size_t val_hdr_len = (size_t)(vp - val_hdr);
+	iov[0].iov_base = hdr_buf;
+	iov[0].iov_len  = hdr_len;
 
-    /* Calculate total payload length across all 5 vectors */
-    uint32_t total_payload = (uint32_t)(hdr_payload + (size_t)attr->len + meta_len + val_hdr_len + val_len);
-    hdr_buf[0] = (char)0xce;
-    hdr_buf[1] = (char)(total_payload >> 24);
-    hdr_buf[2] = (char)(total_payload >> 16);
-    hdr_buf[3] = (char)(total_payload >> 8);
-    hdr_buf[4] = (char)(total_payload);
+	if (tnt_writev_all(c->sock_fd, iov, 1) < 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
 
-    /* 5-Vector Scatter-Gather I/O: 100% Zero-Copy & Zero-Allocation */
-    struct iovec iov[5];
-    iov[0].iov_base = hdr_buf;
-    iov[0].iov_len  = hdr_payload + 5;
+	blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
+	if (blen <= 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
 
-    iov[1].iov_base = (void *)attr->s;   // Vector 1: direct pointer to call_id string
-    iov[1].iov_len  = (size_t)attr->len;
-
-    iov[2].iov_base = meta_buf;          // Vector 2: fixed metadata
-    iov[2].iov_len  = meta_len;
-
-    iov[3].iov_base = val_hdr;           // Vector 3: payload string header
-    iov[3].iov_len  = val_hdr_len;
-
-    iov[4].iov_base = (void *)val->s;    // Vector 4: direct pointer to SDP body (ZERO-COPY)
-    iov[4].iov_len  = val_len;
-
-    if (tnt_writev_all(c->sock_fd, iov, 5) < 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-
-    char resp[512], *dyn = NULL;
-    ssize_t blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
-    if (blen <= 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-    rc = check_iproto_status(dyn ? dyn : resp, (size_t)blen, sync_id);
-    if (dyn) pkg_free(dyn);
-    if (rc == -2) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-    return rc;
+	rc = check_iproto_status(dyn ? dyn : resp, (size_t)blen, sync_id);
+	if (dyn) pkg_free(dyn);
+	if (rc < 0) {
+		if (rc == -2) tnt_conn_error(tcon, c);
+		return -1;
+	}
+	return 0;
 }
 
-/* Fast IPROTO_DELETE (C Memtx Path, ~1us) */
-int tarantool_remove(cachedb_con *con, str *attr) {
-    if (!con || !attr) return -1;
-    tnt_cluster_con_t *tcon = TNT_CON(con);
-    if (!tcon) return -1;
-    tnt_single_conn_t *c = tnt_get_conn(tcon);
-    int rc;
-    if (!c) return -1;
+int tarantool_remove(cachedb_con *con, const str *attr)
+{
+	tnt_cluster_con_t *tcon = (tnt_cluster_con_t *)con;
+	tnt_single_conn_t *c;
+	char buf[1024];
+	uint64_t sync_id;
+	size_t len;
+	char *p;
+	char resp[512], *dyn = NULL;
+	ssize_t blen;
+	int rc;
 
-    if (attr->len > 512) {
-        LM_ERR("Key too long (%d)\n", attr->len);
-        return -1;
-    }
+	if (!tcon || !attr)
+		return -1;
 
-    char buf[1024];
-    uint64_t sync_id = ++c->sync_counter;
-    size_t len = pack_delete_header(buf, sync_id, tcon->space_id);
-    char *p = buf + len;
-    p = mp_encode_str(p, attr->s, attr->len);
-    len = (size_t)(p - buf);
-    finalize_packet(buf, len);
+	c = tnt_get_conn(tcon);
+	if (!c)
+		return -1;
 
-    if (tnt_send_all(c->sock_fd, buf, len) < 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
+	sync_id = ++c->sync_counter;
+	len = pack_delete_header(buf, sync_id, tcon->space_id);
+	p = buf + len;
+	p = mp_encode_str(p, attr->s, (uint32_t)attr->len);
+	len = (size_t)(p - buf);
+	finalize_packet(buf, len);
 
-    char resp[512], *dyn = NULL;
-    ssize_t blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
-    if (blen <= 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-    rc = check_iproto_status(dyn ? dyn : resp, (size_t)blen, sync_id);
-    if (dyn) pkg_free(dyn);
-    if (rc == -2) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-    return rc;
+	if (tnt_send_all(c->sock_fd, buf, len) < 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
+	if (blen <= 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	rc = check_iproto_status(dyn ? dyn : resp, (size_t)blen, sync_id);
+	if (dyn) pkg_free(dyn);
+	if (rc < 0) {
+		if (rc == -2) tnt_conn_error(tcon, c);
+		return -1;
+	}
+	return 0;
 }
 
-int tarantool_raw_query(cachedb_con *con, str *query, cdb_raw_entry ***reply, int num_cols, int *num_rows) {
-    (void)num_cols;
-    if (!con || !query) return -1;
-    tnt_cluster_con_t *tcon = TNT_CON(con);
-    if (!tcon) return -1;
-    tnt_single_conn_t *c = tnt_get_conn(tcon);
-    if (!c) return -1;
+int tarantool_raw_query(cachedb_con *con, const str *query, cdb_raw_entry ***reply, int num_cols, int *num_rows)
+{
+	(void)num_cols;
+	tnt_cluster_con_t *tcon = (tnt_cluster_con_t *)con;
+	tnt_single_conn_t *c;
+	char buf[4096];
+	uint64_t sync_id;
+	char *p;
+	size_t len;
+	char resp[4096], *dyn = NULL;
+	ssize_t blen;
+	int rc;
 
-    char buf[4096];
-    uint64_t sync_id = ++c->sync_counter;
-    
-    char *p = buf + 5;
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
-    p = mp_encode_uint(p, IPROTO_EVAL);
-    p = mp_encode_uint(p, IPROTO_SYNC);
-    p = mp_encode_uint(p, sync_id);
+	if (!tcon || !query)
+		return -1;
 
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_EXPR);
-    p = mp_encode_str(p, query->s, query->len);
-    p = mp_encode_uint(p, IPROTO_TUPLE);
-    p = mp_encode_array(p, 0);
+	c = tnt_get_conn(tcon);
+	if (!c)
+		return -1;
 
-    size_t len = (size_t)(p - buf);
-    finalize_packet(buf, len);
+	sync_id = ++c->sync_counter;
+	p = buf + 5;
 
-    if (tnt_send_all(c->sock_fd, buf, len) < 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
+	p = mp_encode_uint(p, IPROTO_EVAL);
+	p = mp_encode_uint(p, IPROTO_SYNC);
+	p = mp_encode_uint(p, sync_id);
 
-    char resp[4096], *dyn = NULL;
-    ssize_t blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
-    if (blen <= 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_EXPR);
+	p = mp_encode_str(p, query->s, (uint32_t)query->len);
+	p = mp_encode_uint(p, IPROTO_TUPLE);
+	p = mp_encode_array(p, 0);
 
-    const char *actual_resp = dyn ? dyn : resp;
+	len = (size_t)(p - buf);
+	finalize_packet(buf, len);
 
-    if (num_rows) *num_rows = 1;
-    if (reply) {
-        cdb_raw_entry **arr = (cdb_raw_entry **)pkg_malloc(sizeof(cdb_raw_entry *));
-        if (arr) {
-            arr[0] = (cdb_raw_entry *)pkg_malloc(sizeof(cdb_raw_entry));
-            if (arr[0]) {
-                arr[0]->val.s.s = (char *)pkg_malloc(blen + 1);
-                if (arr[0]->val.s.s) {
-                    memcpy(arr[0]->val.s.s, actual_resp, blen);
-                    arr[0]->val.s.s[blen] = '\0';
-                    arr[0]->val.s.len = (int)blen;
-                }
-                arr[0]->type = CDB_STR;
-            }
-            *reply = arr;
-        }
-    }
-    if (dyn) pkg_free(dyn);
-    return 0;
+	if (tnt_send_all(c->sock_fd, buf, len) < 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
+	if (blen <= 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	rc = check_iproto_status(dyn ? dyn : resp, (size_t)blen, sync_id);
+	if (dyn) pkg_free(dyn);
+	if (rc < 0) {
+		if (rc == -2) tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	if (reply && num_rows)
+		*num_rows = 0;
+
+	return 0;
 }
 
-int tarantool_call_proc(tnt_cluster_con_t *tcon, const str *proc, const str *args, str *res) {
-    if (!tcon || !proc || !res) return -1;
-    tnt_single_conn_t *c = tnt_get_conn(tcon);
-    if (!c) return -1;
+int tarantool_call_proc(tnt_cluster_con_t *tcon, const str *proc, const str *args, str *res)
+{
+	tnt_single_conn_t *c;
+	char buf[4096];
+	uint64_t sync_id;
+	char *p;
+	size_t len;
+	char resp[4096], *dyn = NULL;
+	ssize_t blen;
+	int rc;
 
-    char buf[4096];
-    uint64_t sync_id = ++c->sync_counter;
+	if (!tcon || !proc)
+		return -1;
 
-    char proc_name[256];
-    int plen = proc->len < (int)sizeof(proc_name) - 1 ? proc->len : (int)sizeof(proc_name) - 1;
-    memcpy(proc_name, proc->s, plen);
-    proc_name[plen] = '\0';
+	c = tnt_get_conn(tcon);
+	if (!c)
+		return -1;
 
-    size_t len = pack_call_header(buf, sync_id, proc_name, plen, args ? 1 : 0);
-    char *p = buf + len;
-    if (args && args->len > 0) {
-        p = mp_encode_str(p, args->s, args->len);
-    }
-    len = (size_t)(p - buf);
-    finalize_packet(buf, len);
+	sync_id = ++c->sync_counter;
+	p = buf + 5;
 
-    if (tnt_send_all(c->sock_fd, buf, len) < 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
+	p = mp_encode_uint(p, IPROTO_CALL);
+	p = mp_encode_uint(p, IPROTO_SYNC);
+	p = mp_encode_uint(p, sync_id);
 
-    char resp[4096], *dyn = NULL;
-    ssize_t blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
-    if (blen <= 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
+	p = mp_encode_map(p, 2);
+	p = mp_encode_uint(p, IPROTO_FUNCTION_NAME);
+	p = mp_encode_str(p, proc->s, (uint32_t)proc->len);
+	p = mp_encode_uint(p, IPROTO_TUPLE);
+	if (args && args->len > 0) {
+		p = mp_encode_array(p, 1);
+		p = mp_encode_str(p, args->s, (uint32_t)args->len);
+	} else {
+		p = mp_encode_array(p, 0);
+	}
 
-    const char *actual_resp = dyn ? dyn : resp;
-    char *ret_str = (char *)pkg_malloc(blen + 1);
-    if (ret_str) {
-        memcpy(ret_str, actual_resp, blen);
-        ret_str[blen] = '\0';
-        res->s = ret_str;
-        res->len = (int)blen;
-    }
-    if (dyn) pkg_free(dyn);
-    return 0;
+	len = (size_t)(p - buf);
+	finalize_packet(buf, len);
+
+	if (tnt_send_all(c->sock_fd, buf, len) < 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
+	if (blen <= 0) {
+		tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	rc = check_iproto_status(dyn ? dyn : resp, (size_t)blen, sync_id);
+	if (dyn) pkg_free(dyn);
+	if (rc < 0) {
+		if (rc == -2) tnt_conn_error(tcon, c);
+		return -1;
+	}
+
+	if (res) {
+		res->s = NULL;
+		res->len = 0;
+	}
+	return 0;
 }
 
-int tarantool_eval_expr(tnt_cluster_con_t *tcon, const str *expr, const str *args, str *res) {
-    (void)args;
-    if (!tcon || !expr || !res) return -1;
-    tnt_single_conn_t *c = tnt_get_conn(tcon);
-    if (!c) return -1;
-
-    char buf[4096];
-    uint64_t sync_id = ++c->sync_counter;
-
-    char *p = buf + 5;
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_REQUEST_TYPE);
-    p = mp_encode_uint(p, IPROTO_EVAL);
-    p = mp_encode_uint(p, IPROTO_SYNC);
-    p = mp_encode_uint(p, sync_id);
-
-    p = mp_encode_map(p, 2);
-    p = mp_encode_uint(p, IPROTO_EXPR);
-    p = mp_encode_str(p, expr->s, expr->len);
-    p = mp_encode_uint(p, IPROTO_TUPLE);
-    p = mp_encode_array(p, 0);
-
-    size_t len = (size_t)(p - buf);
-    finalize_packet(buf, len);
-
-    if (tnt_send_all(c->sock_fd, buf, len) < 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-
-    char resp[4096], *dyn = NULL;
-    ssize_t blen = tnt_read_frame(c, resp, sizeof(resp), &dyn);
-    if (blen <= 0) {
-        tnt_conn_error(tcon, c);
-        return -1;
-    }
-
-    const char *actual_resp = dyn ? dyn : resp;
-    char *ret_str = (char *)pkg_malloc(blen + 1);
-    if (ret_str) {
-        memcpy(ret_str, actual_resp, blen);
-        ret_str[blen] = '\0';
-        res->s = ret_str;
-        res->len = (int)blen;
-    }
-    if (dyn) pkg_free(dyn);
-    return 0;
+int tarantool_eval_expr(tnt_cluster_con_t *tcon, const str *expr, const str *args, str *res)
+{
+	(void)args;
+	(void)res;
+	return tarantool_raw_query((cachedb_con *)tcon, expr, NULL, 0, NULL);
 }
